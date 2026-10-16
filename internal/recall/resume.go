@@ -200,7 +200,12 @@ func appendViewLine(b *strings.Builder, line string, budget int) {
 
 func recordView(record resumeRecord, budget int) string {
 	var b strings.Builder
-	appendViewLine(&b, "- 목표/제목: "+cut(mask(record.m.Title), 60), budget)
+	heading := "- 목표/제목: " + cut(mask(record.m.Title), 60)
+	if len(record.requests) > 1 {
+		// A long conversation keeps its first request as its title after the work moved on.
+		heading += " (처음 요청 — 지금 일은 아래 최신 원문)"
+	}
+	appendViewLine(&b, heading, budget)
 	if len(record.requests) > 0 {
 		appendViewLine(&b, "  이전 사용자 원문(최신부터, 아래 요약보다 우선):", budget)
 		b.WriteString(requestView(record.requests, 4, min(max(0, budget-len([]rune(b.String()))), budget*3/5)))

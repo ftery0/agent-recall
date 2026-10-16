@@ -36,7 +36,7 @@ func TestStartMarksPullRequestsMergedAfterTheNoteWasSaved(t *testing.T) {
 	commitAt(t, f.repo, merged, "Merge pull request #12 from me/feature")
 	writeNote(t, f, "personal/10_프로젝트/P/작업 기록/일.md", "---\nstatus: 진행\nrepos: fixrepo\n---\n## 현재 상태\n- PR #12 → dev (머지 안 함), 예전 PR #7 은 머지됨\n## 다음\n1. PR #12 리뷰·머지\n", saved)
 	card := Start("codex", memory.Object{"cwd": f.repo})
-	want := "다음: PR #12 리뷰·머지 (" + saved.Local().Format("01-02 15:04") + ") ⚠ 노트 저장 뒤 PR #12 " + merged.Local().Format("01-02 15:04") + " 머지됨 (내 컴퓨터 git 기록)"
+	want := "다음: PR #12 리뷰·머지 (" + saved.Local().Format("01-02 15:04") + ") ⚠ 노트 저장 뒤 PR #12 " + merged.Local().Format("01-02 15:04") + " 머지됨 (내 컴퓨터 git 기록) — 이 '다음'은 끝난 일일 수 있다. 노트를 고칠지 사용자에게 묻는다"
 	if !strings.Contains(card, want) || strings.Contains(card, "PR #7 ") {
 		t.Fatalf("missing %q or marked a merge older than the note\n%s", want, card)
 	}

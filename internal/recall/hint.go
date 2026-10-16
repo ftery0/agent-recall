@@ -21,9 +21,47 @@ var (
 	hintTicket   = regexp.MustCompile(`(?i)\bTSK-\d+\b`)
 	hintPR       = regexp.MustCompile(`(?i)\bPR\s*#?\s*(\d{2,5})\b`) // "PR 2개" is a count, not a number
 	hintLeftOff  = regexp.MustCompile(`저번|지난\s?번|전에 하던|하던\s?거|하다가?\s?말`)
-	hintPasted   = regexp.MustCompile(`(?s)<pasted_content[^>]*>.*?</pasted_content[^>]*>`)
+	hintPasted   = regexp.MustCompile(`(?s)<pasted_content[^>]*>.*?(</pasted_content[^>]*>|$)`)
 	hintLogTime  = regexp.MustCompile(`^[ T]\d\d:\d\d`)
+	// Words that only ask about the past or ask for an answer; what is left names the topic.
+	hintFiller = map[string]bool{"저번": true, "지난번": true, "지난": true, "전에": true, "하던": true, "하던거": true, "그거": true, "이거": true, "저거": true,
+		"어디": true, "어디까지": true, "뭐였지": true, "했는지": true, "했었지": true, "하다가": true, "말았던": true, "이어서": true, "계속": true,
+		"다시": true, "이유": true, "우리": true, "내가": true, "너가": true, "여기": true, "거기": true, "저기": true, "항상": true, "어제": true,
+		"그제": true, "그저께": true, "오늘": true, "있냐": true, "있니": true, "있던데": true, "했던데": true,
+		"보고": true, "정리": true, "확인": true, "하자": true, "해보자": true, "진행": true, "얘기": true, "애기": true, "무슨": true,
+		"어떻게": true, "됐어": true, "됐지": true, "했어": true, "할일": true, "해야": true, "해야되는거": true, "부분": true, "내용": true,
+		"뭐하다": true, "하다": true, "말았니": true, "말았지": true, "기억": true, "안나": true, "지금": true, "한번": true, "그냥": true,
+		"일단": true, "근데": true, "그리고": true, "전부": true, "전부다": true, "이제": true, "같은데": true, "보니까": true}
+	hintFillerEnd = []string{"줘", "줘봐", "봐", "봐줘", "해봐", "할까", "했지", "했나", "는지", "던데", "있니", "있냐"}
+	hintDayPart   = regexp.MustCompile(`^\d{1,2}(월|일)$`)
 )
+
+// hintTopic is the request's words without the ones that only point to the past.
+func hintTopic(prompt string) []string {
+	var topic []string
+	for _, word := range terms(prompt) {
+		word = strings.TrimRight(word, "?!.,~")
+		if len([]rune(word)) < 2 || hintFiller[word] || hintDayWord(word) {
+			continue
+		}
+		filler := false
+		for _, end := range hintFillerEnd {
+			filler = filler || strings.HasSuffix(word, end)
+		}
+		if !filler && !slices.Contains(topic, word) {
+			topic = append(topic, word)
+		}
+	}
+	// A long sentence left after the filler is not a topic to search for.
+	if len(topic) > 4 {
+		return nil
+	}
+	return topic
+}
+
+func hintDayWord(word string) bool {
+	return hintISODay.MatchString(word) || hintMonthDay.MatchString(word) || hintDayPart.MatchString(word)
+}
 
 // HintText is what the harness looks up before the agent answers: the day, ticket, pull request
 // or unfinished work a request points to. A request that points nowhere in the past gets nothing.
@@ -31,9 +69,10 @@ func HintText(prompt, cwd, session string, now time.Time) string {
 	// Pasted text is someone else's words, often logs full of dates and numbers.
 	prompt = hintPasted.ReplaceAllString(prompt, " ")
 	repo := RepoName(cwd)
+	topic := hintTopic(hintTicket.ReplaceAllString(hintPR.ReplaceAllString(prompt, " "), " "))
 	var parts []string
 	if day, ok := hintDay(prompt, now); ok {
-		parts = append(parts, dayHint(day, repo))
+		parts = append(parts, dayHint(day, repo, topic))
 	}
 	var tickets []string
 	for _, ticket := range hintTicket.FindAllString(prompt, -1) {
@@ -47,7 +86,11 @@ func HintText(prompt, cwd, session string, now time.Time) string {
 	}
 	// "저번 주" is a week, not the work left off.
 	if len(parts) == 0 && hintLeftOff.MatchString(strings.NewReplacer("저번주", "", "저번 주", "").Replace(prompt)) {
-		parts = append(parts, leftOffHint(repo, session))
+		if hint := topicHint(topic, session); hint != "" {
+			parts = append(parts, hint)
+		} else {
+			parts = append(parts, leftOffHint(repo, session))
+		}
 	}
 	if len(parts) == 0 {
 		return ""
@@ -83,19 +126,56 @@ func hintDay(prompt string, now time.Time) (time.Time, bool) {
 }
 
 // dayHint is the day in one line per conversation, this repository's first.
-func dayHint(day time.Time, repo string) string {
+// With topic words it keeps the conversations that mention them, and all of them if none does.
+func dayHint(day time.Time, repo string, topic []string) string {
 	date := day.Format("2006-01-02")
-	all := dayConversations(day, nil)
+	all, label := dayConversations(day, topic), fmt.Sprintf("%s 중 '%s'", date, strings.Join(topic, " "))
+	if len(topic) == 0 || len(all) == 0 {
+		all, label = dayConversations(day, nil), date
+	}
 	if len(all) == 0 {
 		return fmt.Sprintf("[%s] 그날 기록된 요청이 없다", date)
 	}
 	sort.SliceStable(all, func(i, j int) bool { return all[i].repo == repo && all[j].repo != repo })
-	lines := []string{fmt.Sprintf("[%s 대화 %d개 — 전부: harness recall day %s]", date, len(all), date)}
+	lines := []string{fmt.Sprintf("[%s 대화 %d개 — 전부: harness recall day %s]", label, len(all), date)}
 	for _, c := range all[:min(len(all), 5)] {
 		last := c.requests[len(c.requests)-1]
-		lines = append(lines, fmt.Sprintf("- %s · %s · 그날 마지막 %s %s (세션 %s)", c.repo, cut(c.title, 40), last.at.Format("15:04"), cut(last.text, 60), short(c.session)))
+		lines = append(lines, fmt.Sprintf("- %s · 그날 마지막 %s %s%s (세션 %s)", c.repo, last.at.Format("15:04"), cut(last.text, 60), firstTitle(c.title, last.text), short(c.session)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// topicHint is what the topic words find outside this conversation, or nothing.
+func topicHint(topic []string, session string) string {
+	if len(topic) == 0 {
+		return ""
+	}
+	query := strings.Join(topic, " ")
+	var lines []string
+	for _, h := range Find(query, 6) {
+		id := header([]byte(h.text), "session")
+		if id == session && id != "" || len(lines) == 3 {
+			continue
+		}
+		line := fmt.Sprintf("- %s · %s", cut(h.Title, 40), cut(h.Line, 90))
+		if id != "" {
+			line += " (세션 " + short(id) + ")"
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(append([]string{fmt.Sprintf("['%s' 찾은 기억 — 더: harness recall find '%s']", query, query)}, lines...), "\n")
+}
+
+// firstTitle names a conversation's first request when it differs from the latest one; a long
+// conversation keeps its first request as its title long after the work moved on.
+func firstTitle(title, latest string) string {
+	if title == "" || strings.HasPrefix(latest, strings.TrimSuffix(title, "…")) {
+		return ""
+	}
+	return " (처음: " + cut(title, 30) + ")"
 }
 
 func findHint(label, query string, limit int) string {
@@ -146,8 +226,8 @@ func leftOffHint(repo, session string) string {
 			continue
 		}
 		last := requests[len(requests)-1]
-		all = append(all, recent{last.at, fmt.Sprintf("- %s %s — 마지막 요청 %s · 끝난 지점(AI 주장) %s (세션 %s)",
-			last.at.Format("01-02 15:04"), cut(title(string(raw), filepath.Base(path)), 40), cut(last.text, 60), cut(last.answer, 60), short(header(raw, "session")))})
+		all = append(all, recent{last.at, fmt.Sprintf("- %s 마지막 요청 %s%s · 끝난 지점(AI 주장) %s (세션 %s)",
+			last.at.Format("01-02 15:04"), cut(last.text, 60), firstTitle(title(string(raw), filepath.Base(path)), last.text), cut(last.answer, 60), short(header(raw, "session")))})
 	}
 	if len(all) == 0 {
 		return "[이 레포 최근 대화] 기록 없음"

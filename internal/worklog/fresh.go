@@ -51,7 +51,7 @@ func mergedSince(root string, n note) string {
 	if len(merged) == 0 {
 		return ""
 	}
-	return " ⚠ 노트 저장 뒤 " + strings.Join(merged, ", ") + " (내 컴퓨터 git 기록)"
+	return " ⚠ 노트 저장 뒤 " + strings.Join(merged, ", ") + " (내 컴퓨터 git 기록) — 이 '다음'은 끝난 일일 수 있다. 노트를 고칠지 사용자에게 묻는다"
 }
 
 // memoryLines warns about project memories whose files were committed after the memory was

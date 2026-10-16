@@ -11,7 +11,7 @@ Session memory for AI coding agents. It keeps your Claude Code and Codex convers
 - **Archive** — copies each conversation transcript (`.jsonl`) to `~/.local/share/harness/raw/`, so the source survives the client's own cleanup.
 - **Dated records** — writes one Markdown record per conversation: requests with their time, the agent's answers (marked as claims), the last stopping point, changed files, checks, commits, and the memory lookups the agent ran.
 - **Start card** — when a conversation starts, shows the latest requests, related records, recent work notes and git state (within 3,000 characters). It warns when a note's pull request was merged after the note was saved, or when files named in a project memory were committed after it.
-- **Prompt hint** — when a request points to the past ("yesterday", a date, "where we left off", `TSK-123`, `PR #12`), it adds the matching records (within 1,200 characters). Other requests get nothing.
+- **Prompt hint** — when a request points to the past ("yesterday", a date, "where we left off", `TSK-123`, `PR #12`), it adds the matching records (within 1,200 characters). When the request also names a topic ("where did we leave the image modal"), it searches with those words first and falls back to the latest conversations. Other requests get nothing.
 - **Misses** — counts memory lookups that came back empty or failed, and tells you once a week.
 
 Messages and keyword matching are currently in Korean.

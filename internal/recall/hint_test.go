@@ -19,8 +19,8 @@ func TestHintFindsTheDayTicketAndUnfinishedWorkARequestPointsTo(t *testing.T) {
 	}
 	text := HintText("어제 한 거 보고 오늘 할 일 정리해줘", "/work/repo", "", now)
 	for _, want := range []string{"=== 하네스가 질문을 보고 먼저 찾은 기억", "[2026-10-08 대화 2개 — 전부: harness recall day 2026-10-08]",
-		"- repo · 밤에 시작한 일 · 그날 마지막 09:10 아침에 이어서 한 일 (세션 " + short(night) + ")",
-		"- repo · 다른 대화 첫 요청 · 그날 마지막 10:00 다른 대화 두번째 요청 (세션 " + short(morning) + ")"} {
+		"- repo · 그날 마지막 09:10 아침에 이어서 한 일 (처음: 밤에 시작한 일) (세션 " + short(night) + ")",
+		"- repo · 그날 마지막 10:00 다른 대화 두번째 요청 (처음: 다른 대화 첫 요청) (세션 " + short(morning) + ")"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q\n%s", want, text)
 		}
@@ -42,8 +42,18 @@ func TestHintFindsTheDayTicketAndUnfinishedWorkARequestPointsTo(t *testing.T) {
 		t.Fatal("티켓을 찾지 못함", text)
 	}
 	text = HintText("우리 전에 하던 거 이어서 하자", "/work/repo", night, now)
-	if !strings.Contains(text, "[이 레포 최근 대화 — 원문: harness recall source <세션> <말>]\n- 10-08 10:00 다른 대화 첫 요청 — 마지막 요청 다른 대화 두번째 요청 · 끝난 지점(AI 주장) 두번째 요청도 끝냈습니다. (세션 "+short(morning)+")") || strings.Contains(text, short(night)) {
+	if !strings.Contains(text, "[이 레포 최근 대화 — 원문: harness recall source <세션> <말>]\n- 10-08 10:00 마지막 요청 다른 대화 두번째 요청 (처음: 다른 대화 첫 요청) · 끝난 지점(AI 주장) 두번째 요청도 끝냈습니다. (세션 "+short(morning)+")") || strings.Contains(text, short(night)) {
 		t.Fatal("지금 대화를 빼고 최근 대화를 보이지 못함", text)
+	}
+	text = HintText("저번에 촬영 설정 맞추기 어디까지 했지", "/work/repo", night, now)
+	if !strings.Contains(text, "['촬영 설정 맞추기' 찾은 기억 — 더: harness recall find '촬영 설정 맞추기']\n- 영상 탭 · - TSK-1344 촬영 설정 맞추기") || strings.Contains(text, "이 레포 최근 대화") {
+		t.Fatal("주제 말로 찾지 않음", text)
+	}
+	if text := HintText("저번에 없는주제말 어디까지 했지", "/work/repo", night, now); !strings.Contains(text, "[이 레포 최근 대화") {
+		t.Fatal("주제를 못 찾았을 때 최근 대화로 돌아가지 않음", text)
+	}
+	if text := HintText("어제 아침에 이어서 한 거 보여줘", "/work/repo", "", now); !strings.Contains(text, "[2026-10-08 중 '아침' 대화 1개") || strings.Contains(text, short(morning)) {
+		t.Fatal("그날 대화를 주제 말로 거르지 않음", text)
 	}
 	if text := HintText(strings.Repeat("어제 TSK-1344 PR #12 ", 50), "/work/repo", "", now); len([]rune(text)) > hintLimit+1 {
 		t.Fatal("붙이는 글이 한도를 넘음", len([]rune(text)))
