@@ -56,7 +56,7 @@ harness recall verify
 
 ## 상태
 
-개인 프로젝트를 다른 사람도 고치고 넓힐 수 있게 공개했습니다. 안내 문구가 한국어뿐이고, macOS 위주이며, 예전 판의 명령(`memory`·`policy`·`edit-scope`)이 남아 있습니다.
+개인 프로젝트를 다른 사람도 고치고 넓힐 수 있게 공개했습니다. 안내 문구가 한국어뿐이고, macOS 위주이며, 예전 판의 편집 훅(`edit-scope`·`structure-check`)이 남아 있습니다. 옛 SQLite 기억 DB는 지웠습니다.
 
 ## 라이선스
 

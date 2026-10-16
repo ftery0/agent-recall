@@ -11,7 +11,6 @@ import (
 	"github.com/ftery0/agent-recall/internal/recall"
 	"github.com/ftery0/agent-recall/internal/worklog"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -28,33 +27,18 @@ type structureOutput struct {
 type structureMeasures []policy.StructureMetricsRecord
 
 func run(args []string) (any, error) {
-	home, _ := os.UserHomeDir()
 	f := flag.NewFlagSet("harness", flag.ContinueOnError)
-	config := f.String("config", filepath.Join(home, ".local/share/harness/config.json"), "project configuration")
-	project := f.String("project", "", "selected project")
+	// Registered edit-scope hooks still pass the old memory database's configuration; nothing reads it.
+	f.String("config", "", "unused")
 	if e := f.Parse(args); e != nil {
 		return nil, e
 	}
 	args = f.Args()
 	if len(args) == 0 {
-		return nil, errors.New("use: harness [--config file] memory|hook|version")
+		return nil, errors.New("use: harness worklog|recall|edit-scope|structure-check|install|version")
 	}
 	if args[0] == "version" {
-		return memory.Object{"version": version, "runtime": "go", "schema": "legacy-compatible"}, nil
-	}
-	if args[0] == "restore" {
-		restore := flag.NewFlagSet("restore", flag.ContinueOnError)
-		root := restore.String("data-root", "", "")
-		if len(args) < 2 {
-			return nil, errors.New("backup required")
-		}
-		if e := restore.Parse(args[2:]); e != nil {
-			return nil, e
-		}
-		if *root == "" {
-			return nil, errors.New("--data-root required")
-		}
-		return memory.Restore(args[1], *root)
+		return memory.Object{"version": version, "runtime": "go"}, nil
 	}
 	if args[0] == "install" {
 		return installCLI(args[1:])
@@ -245,87 +229,7 @@ func run(args []string) (any, error) {
 		}
 		return nil, errors.New("use: recall sweep|verify|find WORDS|day YYYY-MM-DD|MM-DD|오늘|어제 [WORDS]|source SESSION [WORDS]|misses [--days N]|eval FILE|import-memory|relearn [--dry-run|--expect-token TOKEN]|build [--since DAY] [--model]|sync|lang [--since DAY] [--sample N] [FILE...]")
 	}
-	cwd, e := os.Getwd()
-	if e != nil {
-		return nil, e
-	}
-	var payload memory.Object
-	if args[0] == "hook" {
-		memoryOnly := len(args) == 2 && strings.HasSuffix(args[1], "-memory") && memory.ValidTool(strings.TrimSuffix(args[1], "-memory"))
-		raw, e := adapters.ReadInput("-")
-		if e != nil {
-			if memoryOnly {
-				fmt.Fprintln(os.Stderr, "미확인: 기억 이벤트 읽기 실패:", e)
-				return nil, nil
-			}
-			return nil, e
-		}
-		payload, e = memory.Decode(raw)
-		if e != nil {
-			if memoryOnly {
-				fmt.Fprintln(os.Stderr, "미확인: 기억 이벤트 해석 실패:", e)
-				return nil, nil
-			}
-			return nil, e
-		}
-		if len(args) == 2 && strings.HasSuffix(args[1], "-memory") {
-			tool := strings.TrimSuffix(args[1], "-memory")
-			if tool == "claude" && payload["hook_source"] == "opencode-plugin" {
-				return nil, nil
-			}
-			if memory.ValidTool(tool) {
-				payload, e = adapters.NormalizeMemoryPayload(tool, payload)
-				if e != nil {
-					fmt.Fprintln(os.Stderr, "미확인: 기억 이벤트 해석 실패:", e)
-					return adapters.MemoryHookOutput(tool, payload, nil), nil
-				}
-			}
-		}
-		cwd = memory.Text(payload["cwd"])
-	}
-	c, e := adapters.Load(*config, *project, cwd)
-	if e != nil {
-		if args[0] == "hook" && len(args) == 2 && strings.HasSuffix(args[1], "-memory") {
-			tool := strings.TrimSuffix(args[1], "-memory")
-			if memory.ValidTool(tool) {
-				if !adapters.IsOutside(e) {
-					fmt.Fprintln(os.Stderr, "미확인: 기억 설정 읽기 실패:", e)
-				}
-				return adapters.MemoryHookOutput(tool, payload, nil), nil
-			}
-		}
-		if args[0] == "hook" && adapters.IsOutside(e) {
-			if len(args) != 2 {
-				return nil, errors.New("hook codex|claude required")
-			}
-			return adapters.Hook(adapters.Config{}, false, args[1], payload, adapters.Home())
-		}
-		return nil, e
-	}
-	switch args[0] {
-	case "status":
-		return status(c)
-	case "policy":
-		return policyCLI(c, args[1:])
-	case "memory":
-		return adapters.MemoryCLI(c, args[1:])
-	case "hook":
-		if len(args) != 2 {
-			return nil, errors.New("hook codex|claude required")
-		}
-		if strings.HasSuffix(args[1], "-memory") && memory.ValidTool(strings.TrimSuffix(args[1], "-memory")) {
-			tool := strings.TrimSuffix(args[1], "-memory")
-			result, err := adapters.Capture(c, tool, payload)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "미확인: 기억 수집 실패:", err)
-				result = memory.Object{"systemMessage": "미확인: 기억 수집 실패: " + err.Error()}
-			}
-			return adapters.MemoryHookOutput(tool, payload, result), nil
-		}
-		return adapters.Hook(c, true, args[1], payload, adapters.Home())
-	default:
-		return nil, errors.New("unknown command")
-	}
+	return nil, errors.New("unknown command")
 }
 
 func parseSince(value string) (time.Time, error) {
@@ -476,9 +380,7 @@ func main() {
 		}
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetEscapeHTML(false)
-		if object, ok := result.(memory.Object); !ok || object["format"] != "brief" {
-			encoder.SetIndent("", "  ")
-		}
+		encoder.SetIndent("", "  ")
 		if e = encoder.Encode(result); e != nil {
 			fmt.Fprintln(os.Stderr, e)
 			os.Exit(1)

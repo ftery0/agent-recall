@@ -9,43 +9,6 @@ import (
 	"testing"
 )
 
-func TestScopeDoesNotExpandOrRestore(t *testing.T) {
-	root := t.TempDir()
-	s := Scope{Root: root, Runtime: t.TempDir(), Task: "task", Session: "session"}
-	path := filepath.Join(root, "one.go")
-	g := memory.Object{"task": "task", "session": "session", "action": "edit", "paths": []any{path}, "source": "event:user-request"}
-	if _, e := s.Update("grant", g); e != nil {
-		t.Fatal(e)
-	}
-	s.Update("status", nil)
-	v, e := s.Check("edit", path)
-	if e != nil || v["decision"] != "in-scope" {
-		t.Fatal(v, e)
-	}
-	v, _ = s.Check("push", "git push")
-	if v["decision"] != "question-required" {
-		t.Fatal(v)
-	}
-	other := s
-	other.Session = "new"
-	v, _ = other.Check("edit", path)
-	if v["decision"] != "question-required" {
-		t.Fatal(v)
-	}
-	s.Update("hold", nil)
-	v, _ = s.Check("edit", path)
-	if v["decision"] != "question-required" {
-		t.Fatal(v)
-	}
-	if _, e = s.Update("resume", memory.Object{}); e == nil {
-		t.Fatal("unconfirmed resume")
-	}
-	s.Update("resume", memory.Object{"task": "task", "session": "session", "question_id": "actual-q"})
-	v, _ = s.Check("edit", path)
-	if v["decision"] != "in-scope" {
-		t.Fatal(v)
-	}
-}
 func collector(t *testing.T) (Collector, memory.Object) {
 	t.Helper()
 	root := t.TempDir()
@@ -113,13 +76,6 @@ func TestStopDoesNotRunRegisteredChecks(t *testing.T) {
 			if raw, err := os.ReadFile(config); err != nil || string(raw) != string(memory.Packed(cfg)) {
 				t.Fatal("Stop changed the project registry", string(raw), err)
 			}
-			checks, err := RunChecks(Scope{Root: c.Root}, []string{path})
-			if err != nil || len(checks) != 1 || checks[0]["executed"] != true || checks[0]["passed"] != false || checks[0]["exit_code"] != 1 {
-				t.Fatal("explicit failed check lost its result", checks, err)
-			}
-			if raw, err := os.ReadFile(filepath.Join(c.Root, "check-runs")); err != nil || string(raw) != "x" {
-				t.Fatal("explicit check did not run once", string(raw), err)
-			}
 			os.WriteFile(config, []byte("{"), 0600)
 			if out, err := c.Event(p); err != nil || out["checks_status"] != "not_run" || out["edit_evidence_verified"] != true {
 				t.Fatal("Stop still reads project check configuration", out, err)
@@ -186,26 +142,6 @@ func TestExternalEditNotAttributed(t *testing.T) {
 		t.Fatal(r, e)
 	}
 }
-func TestChecksListedInRepoRun(t *testing.T) {
-	root := t.TempDir()
-	os.Mkdir(filepath.Join(root, ".claude"), 0700)
-	path := filepath.Join(root, "a.go")
-	os.WriteFile(path, []byte("package a"), 0600)
-	config := memory.Object{"checks": []any{memory.Object{"name": "fixture", "command": "printf passed > marker", "pattern": `\.go$`}}}
-	os.WriteFile(filepath.Join(root, ".claude/checks.json"), memory.Packed(config), 0600)
-	s := Scope{Root: root, Runtime: t.TempDir(), Task: "t", Session: "s"}
-	r, e := RunChecks(s, []string{path})
-	if e != nil || len(r) != 1 || r[0]["passed"] != true {
-		t.Fatal(r, e)
-	}
-	if _, e = os.Stat(filepath.Join(root, "marker")); e != nil {
-		t.Fatal("listed check did not run")
-	}
-	r, e = RunChecks(s, []string{filepath.Join(root, "a.md")})
-	if e != nil || len(r) != 0 {
-		t.Fatal("unmatched file ran a check", r, e)
-	}
-}
 func TestCorruptStateIsError(t *testing.T) {
 	c, p := collector(t)
 	os.WriteFile(c.path(), []byte("{"), 0600)
@@ -228,7 +164,7 @@ func TestFolderDeletedCount(t *testing.T) {
 	}
 }
 
-func TestNonCodeFileChecksRequireExplicitInvocation(t *testing.T) {
+func TestStopDoesNotRunNonCodeFileChecks(t *testing.T) {
 	c, p := collector(t)
 	file := filepath.Join(c.Root, "ko.json")
 	p["tool_input"] = memory.Object{"file_path": file}
@@ -245,10 +181,6 @@ func TestNonCodeFileChecksRequireExplicitInvocation(t *testing.T) {
 	r, e := c.Event(p)
 	if e != nil || r["decision"] != nil || r["checks_status"] != "not_run" || r["edit_evidence_verified"] != true {
 		t.Fatal(r, e)
-	}
-	checks, e := RunChecks(Scope{Root: c.Root}, []string{file})
-	if e != nil || len(checks) != 1 || checks[0]["passed"] != false {
-		t.Fatal("explicit non-code check lost its failure", checks, e)
 	}
 }
 

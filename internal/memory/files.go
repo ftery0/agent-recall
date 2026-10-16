@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -294,37 +295,7 @@ func Within(root, path string) bool {
 	rel, e := filepath.Rel(r, p)
 	return e == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
-func NewOutput(root, path string) error {
-	if !filepath.IsAbs(path) {
-		return errors.New("absolute output path required")
-	}
-	if Within(root, path) {
-		return errors.New("output overlaps memory data")
-	}
-	if _, e := os.Lstat(path); !os.IsNotExist(e) {
-		return errors.New("output already exists or is inaccessible")
-	}
-	ext := filepath.Ext(path)
-	if ext != ".md" && ext != ".txt" && ext != ".json" {
-		return errors.New("unsupported output extension")
-	}
-	return nil
-}
 
-func WriteNew(path string, raw []byte) error {
-	if e := os.MkdirAll(filepath.Dir(path), 0700); e != nil {
-		return e
-	}
-	f, e := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if e != nil {
-		return e
-	}
-	if _, e = f.Write(raw); e == nil {
-		e = f.Sync()
-	}
-	closeErr := f.Close()
-	if e != nil {
-		return e
-	}
-	return closeErr
+func ValidTool(tool string) bool {
+	return slices.Contains([]string{"codex", "claude", "opencode", "kiro", "cursor", "gemini", "antigravity"}, tool)
 }

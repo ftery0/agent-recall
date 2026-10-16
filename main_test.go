@@ -12,24 +12,6 @@ import (
 	"time"
 )
 
-func TestMemoryOnlyHookDoesNotRunStructureCollector(t *testing.T) {
-	root := t.TempDir()
-	config := filepath.Join(root, "config.json")
-	v := memory.Object{"schema": 1, "category": "personal", "project": "p", "project_root": root, "data_root": filepath.Join(root, "data"), "tasks": []string{"t"}}
-	if e := os.WriteFile(config, memory.Packed(v), 0600); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := memory.Open(filepath.Join(root, "data"), "p", true); e != nil {
-		t.Fatal(e)
-	}
-	if out := runWithInput(t, memory.Object{"hook_event_name": "Stop", "session_id": "unbound", "cwd": root}, "--config", config, "hook", "codex-memory"); out != nil {
-		t.Fatal(out)
-	}
-	if _, e := os.Stat(filepath.Join(root, "data", "p", "runtime")); !os.IsNotExist(e) {
-		t.Fatal("collector unexpectedly ran", e)
-	}
-}
-
 func TestRelearnRejectsAmbiguousOptionsWithoutWriting(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HARNESS_HOME", root)

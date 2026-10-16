@@ -75,7 +75,7 @@ Everything stays on your machine. Records are built without a model. Transcripts
 
 ## Status
 
-Personal project, shared so others can fix and extend it. Expect rough edges: Korean-only messages, macOS-first, and some legacy commands (`memory`, `policy`, `edit-scope`) kept from earlier versions.
+Personal project, shared so others can fix and extend it. Expect rough edges: Korean-only messages, macOS-first, and two edit hooks (`edit-scope`, `structure-check`) kept from earlier versions. The old SQLite memory database was removed.
 
 ## Contributing
 
