@@ -1,0 +1,12 @@
+/harness
+/agent-recall
+/bin/
+/data/
+/generated/
+/backups/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.jsonl
+.DS_Store
+.env

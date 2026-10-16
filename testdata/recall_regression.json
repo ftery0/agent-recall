@@ -1,0 +1,15 @@
+[
+  {"id":"exact-session","question":"정확매치","expect_sessions":["12345678-0000-4000-8000-000000000001"],"keywords":["정확매치"]},
+  {"id":"body-citation","question":"본문인용","expect_sessions":["ffffffff-1111-4111-8111-222222222222"],"keywords":["본문인용"]},
+  {"id":"partial-session","question":"중간조각","expect_sessions":["000000000001"],"keywords":["중간조각"]},
+  {"id":"missing-frontmatter","question":"헤더흉내","expect_sessions":["ffffffff-1111-4111-8111-222222222222"],"keywords":["헤더흉내"]},
+  {"id":"ambiguous-short-session","question":"충돌검색","expect_sessions":["deadbeef"],"keywords":["충돌검색"]},
+  {"id":"resolved-legacy-session","question":"옛별칭","expect_sessions":["abcdef12-0000-4000-8000-000000000003"],"keywords":["옛별칭"]},
+  {"id":"codex-suffix","question":"끝별칭","expect_sessions":["c0decafe"],"keywords":["끝별칭"]},
+  {"id":"unknown-legacy-session","question":"미확인별칭","expect_sessions":["cafebabe"],"keywords":["미확인별칭"]},
+  {"id":"session-alternatives","question":"정확매치","expect_sessions":["ffffffff-1111-4111-8111-222222222222","12345678-0000-4000-8000-000000000001"],"keywords":["정확매치"]},
+  {"id":"note-alternative","question":"노트매치","expect_sessions":["ffffffff-1111-4111-8111-222222222222"],"expect_note":"personal/10_프로젝트/회귀/작업 기록/메모.md","keywords":["노트매치"]},
+  {"id":"path-citation","question":"경로본문","expect_note":"personal/10_프로젝트/회귀/작업 기록/없는.md","keywords":["경로본문"]},
+  {"id":"natural-question-miss","question":"없는자연어","expect_sessions":["12345678-0000-4000-8000-000000000001"],"keywords":["정확매치"]},
+  {"id":"keyword-miss","question":"정확매치","expect_sessions":["12345678-0000-4000-8000-000000000001"],"keywords":["없는검색어"]}
+]
