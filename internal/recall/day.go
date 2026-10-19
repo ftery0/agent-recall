@@ -2,25 +2,16 @@ package recall
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 )
 
-// dayRequest is one request line of a record, placed on the calendar.
-type dayRequest struct {
-	at     time.Time
-	text   string
-	answer string
-}
-
 // dayConversation is one conversation's requests on one day.
 type dayConversation struct {
 	path, session, repo, tool, title string
 	first                            time.Time
-	requests                         []dayRequest
+	requests                         []recordRequest
 }
 
 // dayConversations reads every record, since a record is filed under the day its conversation
@@ -28,15 +19,11 @@ type dayConversation struct {
 // so a repo name narrows the day to that repo.
 func dayConversations(day time.Time, words []string) []dayConversation {
 	var all []dayConversation
-	paths, _ := filepath.Glob(filepath.Join(RecordDir(), "*", "*.md"))
-	for _, path := range paths {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		c := dayConversation{path: path, session: header(raw, "session"), repo: header(raw, "repo"), tool: header(raw, "tool"), title: title(string(raw), filepath.Base(path))}
+	records, _ := loadRecords()
+	for _, rec := range records {
+		c := dayConversation{path: rec.path, session: rec.field("session"), repo: rec.field("repo"), tool: rec.field("tool"), title: rec.title()}
 		about := strings.Join([]string{c.repo, c.tool, c.title, c.session}, " ")
-		for _, r := range dayRequests(string(raw)) {
+		for _, r := range rec.requests() {
 			if r.at.Format("2006-01-02") == day.Format("2006-01-02") && anyWord(r.text+" "+r.answer+" "+about, words) {
 				c.requests = append(c.requests, r)
 			}
@@ -115,60 +102,4 @@ func anyWord(text string, words []string) bool {
 		}
 	}
 	return false
-}
-
-// dayRequests reads the 요청 lines of a record. Format 5 lines carry their day ("01-02 15:04");
-// older lines carry only the time, so a time earlier than the one before means the next day.
-func dayRequests(raw string) []dayRequest {
-	start, err := time.ParseInLocation("2006-01-02", header([]byte(raw), "date"), time.Local)
-	if err != nil {
-		return nil
-	}
-	_, body, ok := strings.Cut(raw, "\n### 요청\n")
-	if !ok {
-		return nil
-	}
-	ending := ""
-	if _, rest, ok := strings.Cut(body, "\n### 끝난 지점\n- "); ok {
-		ending, _, _ = strings.Cut(rest, "\n")
-		ending = strings.TrimSuffix(ending, " (AI 주장)")
-	}
-	var out []dayRequest
-	last := start
-	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, "#") {
-			break
-		}
-		if answer, ok := strings.CutPrefix(line, "  → AI(주장): "); ok && len(out) > 0 {
-			out[len(out)-1].answer = answer
-			continue
-		}
-		stamp, rest, ok := strings.Cut(strings.TrimPrefix(line, "- "), " [")
-		_, text, found := strings.Cut(rest, "] ")
-		if !ok || !found || !strings.HasPrefix(line, "- ") {
-			continue
-		}
-		var at time.Time
-		if len(stamp) == len(requestStamp) {
-			at, err = time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%d-%s", start.Year(), stamp), time.Local)
-			if err == nil && at.Before(start) { // the conversation ran past New Year
-				at = at.AddDate(1, 0, 0)
-			}
-		} else {
-			at, err = time.ParseInLocation("2006-01-02 15:04", last.Format("2006-01-02")+" "+stamp, time.Local)
-			if err == nil && at.Before(last) {
-				at = at.AddDate(0, 0, 1)
-			}
-		}
-		if err != nil {
-			continue
-		}
-		last = at
-		out = append(out, dayRequest{at: at, text: text})
-	}
-	// The last request is answered by where the conversation stopped.
-	if len(out) > 0 && out[len(out)-1].answer == "" {
-		out[len(out)-1].answer = ending
-	}
-	return out
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -442,5 +443,45 @@ func TestResumeShowsWhereACandidateStoppedAndSkipsResentRequest(t *testing.T) {
 	card, err := ResumeText(cwd, "")
 	if err != nil || !strings.Contains(card, "끝난 지점(AI 주장): 장소 칸을 개요 선에 맞췄습니다. 남은 일은 화면 확인입니다.") || strings.Count(card, "] "+resent) != 1 || !strings.Contains(card, "- 목표/제목: "+resent) {
 		t.Fatalf("candidate ending missing or resent request repeated: %s error=%v", card, err)
+	}
+}
+
+// endAt rewrites when a stored record says its conversation ended.
+func endAt(t *testing.T, path, to, end string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, to, regexp.MustCompile(`(?m)^end: .*$`).ReplaceAllString(string(data), "end: "+end))
+}
+
+func TestResumeLeadsWithTheOpenConversationThenNamesTheOthers(t *testing.T) {
+	fixture(t)
+	cwd := t.TempDir()
+	resumeFixture(t, cwd, "current-session", "pending", summary{Title: "지금 작업", Todo: []string{"지금 할 일"}})
+	other := resumeFixture(t, cwd, "other-session", "pending", summary{Title: "다른 작업", Todo: []string{"다른 할 일"}})
+	endAt(t, other, other, "2026-10-07 12:00") // the other conversation moved more recently
+	row := resumeHuman("now", "지금 대화의 입력")
+	row["cwd"], row["sessionId"] = cwd, "current-session"
+	current := filepath.Join(t.TempDir(), "current-session.jsonl")
+	write(t, current, jsonLines(t, row))
+	card, err := ResumeText(cwd, current)
+	now, label, another := strings.Index(card, "지금 작업"), strings.Index(card, "같은 폴더의 다른 대화"), strings.Index(card, "다른 작업")
+	if err != nil || now < 0 || label < now || another < label {
+		t.Fatalf("다른 대화가 지금 대화 입력과 제목 사이에 끼었다: %s error=%v", card, err)
+	}
+}
+
+func TestResumeShowsAConversationKeptInTwoFilesOnce(t *testing.T) {
+	fixture(t)
+	cwd := t.TempDir()
+	resumeFixture(t, cwd, "third-session", "pending", summary{Title: "셋째 작업", Todo: []string{"셋째 할 일"}})
+	split := resumeFixture(t, cwd, "split-session", "pending", summary{Title: "나뉜 작업", Todo: []string{"나뉜 할 일"}})
+	endAt(t, split, split, "2026-10-07 12:00")
+	endAt(t, split, filepath.Join(filepath.Dir(split), "1200-repo-split-2.md"), "2026-10-07 12:30")
+	card, err := ResumeText(cwd, "")
+	if err != nil || strings.Count(card, "나뉜 작업") != 1 || !strings.Contains(card, "셋째 작업") {
+		t.Fatalf("같은 대화가 카드 두 자리를 차지했다: %s error=%v", card, err)
 	}
 }

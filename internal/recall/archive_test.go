@@ -34,6 +34,10 @@ func fixture(t *testing.T) (home, raw string) {
 	t.Setenv("HOME", home)
 	t.Setenv("HARNESS_HOME", filepath.Join(home, "harness"))
 	t.Setenv("TZ", "Asia/Seoul")
+	// Test repositories live in the temp folder, which real records pass over as scratch.
+	saved := scratchRoots
+	scratchRoots = nil
+	t.Cleanup(func() { scratchRoots = saved })
 	return home, filepath.Join(home, "harness", "raw")
 }
 

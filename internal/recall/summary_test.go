@@ -110,7 +110,7 @@ func TestFailedSummarySurvivesManualBudgetThenTurnsOffWithoutModel(t *testing.T)
 	}
 	raw, _ := os.ReadFile(dest)
 	message, attempt := summaryDiagnostics(raw)
-	kept, ok := previousSummary(raw)
+	kept, ok := summaryOf(raw)
 	if header(raw, "summary_state") != "pending" || message == "" || attempt == nil || attempt.RawSHA != s.hash || !ok || kept.Title != old.Title || kept.Todo[0] != old.Todo[0] {
 		t.Fatal("호출 없이 과거 실패 또는 기존 요약 삭제", string(raw))
 	}
@@ -123,7 +123,7 @@ func TestFailedSummarySurvivesManualBudgetThenTurnsOffWithoutModel(t *testing.T)
 	}
 	raw, _ = os.ReadFile(dest)
 	message, attempt = summaryDiagnostics(raw)
-	kept, ok = previousSummary(raw)
+	kept, ok = summaryOf(raw)
 	if header(raw, "summary_state") != "off" || message != "" || attempt != nil || !ok || kept.Title != old.Title || kept.Todo[0] != old.Todo[0] || strings.Contains(string(raw), "요약 갱신:") || !strings.Contains(string(raw), "또 새 원문") {
 		t.Fatal("모델 없는 수집이 대기·실패를 남기거나 기존 요약을 지움", string(raw))
 	}
@@ -165,7 +165,7 @@ func TestStoredPartialSuccessRecoversFailureAndRetainsCursorOnNextFailure(t *tes
 	if json.Unmarshal([]byte(header(raw, "last_summary_attempt")), &savedAttempt) != nil || savedAttempt.Cursor != 1 || savedAttempt.Outcome != "unknown" || header(raw, "summary_cursor") != "1" || strings.Contains(string(raw), "private credential value") {
 		t.Fatal(string(raw))
 	}
-	kept, ok := previousSummary(raw)
+	kept, ok := summaryOf(raw)
 	if !ok || len(kept.Todo) != 2 {
 		t.Fatal("다음 실패가 부분 저장 기억 삭제", kept)
 	}
@@ -226,7 +226,7 @@ func TestSummaryWriteFailureBeforeAndAfterReplacementIsNotReportedAsSaved(t *tes
 				t.Fatal("집계가 실제 저장 기록과 다름", out)
 			}
 			after, _ := os.ReadFile(dest)
-			kept, ok := previousSummary(after)
+			kept, ok := summaryOf(after)
 			if !ok || kept.Todo[0] != "기존 남은 일" || (!replaced && string(after) != before) {
 				t.Fatal("저장 오류로 기존 기억 소실", string(after))
 			}
@@ -314,7 +314,7 @@ func TestLessonFailureRetriesWithoutLosingStoredSummary(t *testing.T) {
 		t.Fatal(out, err)
 	}
 	raw, _ = os.ReadFile(dest)
-	m, ok := previousSummary(raw)
+	m, ok := summaryOf(raw)
 	if header(raw, "lessons_pending") != "false" || !ok || m.Title != "교훈 복구" {
 		t.Fatal(string(raw))
 	}
@@ -396,7 +396,7 @@ func TestBuildFailureKeepsSummaryAcrossRetriesThenRecovers(t *testing.T) {
 			t.Fatal(out, err)
 		}
 		raw, _ := os.ReadFile(dest)
-		kept, ok := previousSummary(raw)
+		kept, ok := summaryOf(raw)
 		if !ok || kept.Decisions[0].Why != old.Decisions[0].Why || kept.Todo[0] != old.Todo[0] {
 			t.Fatal("실패 반복 후 이전 기억 소실", string(raw))
 		}
@@ -409,7 +409,7 @@ func TestBuildFailureKeepsSummaryAcrossRetriesThenRecovers(t *testing.T) {
 		t.Fatal(out, err)
 	}
 	raw, _ := os.ReadFile(dest)
-	kept, _ := previousSummary(raw)
+	kept, _ := summaryOf(raw)
 	if len(kept.Todo) != 2 || len(kept.Decisions) != 1 || header(raw, "summary_state") != "ready" {
 		t.Fatal(string(raw))
 	}

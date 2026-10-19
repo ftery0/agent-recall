@@ -67,11 +67,14 @@ func Start(tool string, payload memory.Object) string {
 	out = append(out, noteLines(vault, r, notes)...)
 	if r.git {
 		out = append(out, memoryLines(tool, payload, r.root)...)
-		out = append(out, "=== git — "+git(r.root, "rev-parse", "--abbrev-ref", "HEAD")+" · "+git(r.root, "rev-parse", "--short", "HEAD")+" ===")
+		branch, _ := Git(r.root, gitWait, "rev-parse", "--abbrev-ref", "HEAD")
+		head, _ := Git(r.root, gitWait, "rev-parse", "--short", "HEAD")
+		out = append(out, "=== git — "+branch+" · "+head+" ===")
 		if payload["recall_context"] != true {
-			out = append(out, git(r.root, "log", "--oneline", "-10"))
+			log, _ := Git(r.root, gitWait, "log", "--oneline", "-10")
+			out = append(out, log)
 		}
-		if status := git(r.root, "status", "-s"); status != "" {
+		if status, _ := Git(r.root, gitWait, "status", "-s"); status != "" {
 			lines := strings.Split(status, "\n")
 			limit := 30
 			if payload["recall_context"] == true {

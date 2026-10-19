@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/ftery0/agent-recall/internal/memory"
+	"github.com/ftery0/agent-recall/internal/worklog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -101,8 +101,8 @@ func merge(all []Lesson, add Lesson, session, day string) []Lesson {
 
 // RepoName is the git top folder's name, else the folder's own name.
 func RepoName(cwd string) string {
-	if raw, err := exec.Command("git", "-C", cwd, "rev-parse", "--show-toplevel").Output(); err == nil {
-		return filepath.Base(strings.TrimSpace(string(raw)))
+	if root := worklog.RepoRoot(cwd); root != "" {
+		return filepath.Base(root)
 	}
 	return filepath.Base(cwd)
 }
@@ -176,11 +176,21 @@ func CardLines(cwd string) []string {
 		}
 		return latestSourceDate(rows[i], false) > latestSourceDate(rows[j], false)
 	})
+	var rules []string
+	for _, l := range rows {
+		rules = append(rules, l.Rule)
+	}
+	// Rules the person confirmed in the fact ledger, newest first.
+	for _, rule := range confirmedRules(repo) {
+		if !slices.Contains(rules, rule) {
+			rules = append(rules, rule)
+		}
+	}
 	var out []string
-	if len(rows) > 0 {
+	if len(rules) > 0 {
 		out = append(out, "=== 배운 것 — 사용자가 확인한 교훈 ===")
-		for _, l := range rows[:min(len(rows), cardLessons)] {
-			out = append(out, "- "+l.Rule)
+		for _, rule := range rules[:min(len(rules), cardLessons)] {
+			out = append(out, "- "+rule)
 		}
 	}
 	return append(out, "=== 과거 작업은 `harness recall find <말>`, 그날 한 일은 `harness recall day <YYYY-MM-DD|어제>`, 원문은 `harness recall source <세션 ID> <말>` 로 본다 ===")

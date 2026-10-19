@@ -8,21 +8,25 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
 
 // Hit is one note or record that matched a search.
 type Hit struct {
-	Path   string
-	Title  string
-	Line   string
-	Score  float64
-	text   string
-	body   string
-	mod    time.Time
-	record bool
+	Path     string
+	Title    string
+	Line     string
+	Score    float64
+	Tier     string // 정확, 단어형 or 부분: how the words were found
+	Ref      string // the request or heading the line came from
+	text     string
+	body     string
+	mod      time.Time
+	start    time.Time // a record's first request; zero for a note
+	record   bool
+	repo     string
+	requests []recordRequest
 }
 
 // Korean particles and endings stuck to a search word; "세션에서" should still find "세션".
@@ -49,9 +53,9 @@ func terms(query string) []string {
 func documents() []Hit {
 	var docs []Hit
 	vault := worklog.VaultDir()
-	add := func(root, base string, skipRecords, record bool) {
+	add := func(root, base string) {
 		filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err == nil && d.IsDir() && skipRecords && d.Name() == recordFolder {
+			if err == nil && d.IsDir() && d.Name() == recordFolder {
 				return filepath.SkipDir
 			}
 			if err != nil || d.IsDir() || filepath.Ext(path) != ".md" {
@@ -64,24 +68,30 @@ func documents() []Hit {
 			}
 			rel, _ := filepath.Rel(base, path)
 			text := string(raw)
-			body := text
-			if strings.HasPrefix(body, "---\n") {
-				if _, rest, ok := strings.Cut(body[4:], "\n---\n"); ok {
-					body = rest
-				}
-			}
-			if record {
-				body = withoutLookups(body)
-			}
-			docs = append(docs, Hit{Path: rel, Title: title(text, d.Name()), text: text, body: body, mod: info.ModTime(), record: record})
+			docs = append(docs, Hit{Path: rel, Title: title(text, d.Name()), text: text, body: frontless(text), mod: info.ModTime(), repo: header(raw, "repos")})
 			return nil
 		})
 	}
-	add(RecordDir(), Dir(), false, true)
+	records, _ := loadRecords()
+	for _, rec := range records {
+		rel, _ := filepath.Rel(Dir(), rec.path)
+		docs = append(docs, Hit{Path: rel, Title: rec.title(), text: string(rec.raw), body: withoutSection(frontless(string(rec.raw)), "기억 명령"),
+			mod: rec.ended(), start: rec.started(), record: true, repo: rec.field("repo"), requests: rec.requests()})
+	}
 	for _, root := range worklog.NoteRoots(vault) {
-		add(root, vault, true, false)
+		add(root, vault)
 	}
 	return docs
+}
+
+// frontless is a file's text after its front matter.
+func frontless(text string) string {
+	if strings.HasPrefix(text, "---\n") {
+		if _, rest, ok := strings.Cut(text[4:], "\n---\n"); ok {
+			return rest
+		}
+	}
+	return text
 }
 
 func title(text, name string) string {
@@ -96,88 +106,42 @@ func title(text, name string) string {
 	return strings.TrimSuffix(name, ".md")
 }
 
-// withoutLookups drops a record's memory lookups: they repeat the words the agent looked for
-// and answer nothing.
-func withoutLookups(body string) string {
-	before, rest, ok := strings.Cut(body, "\n### 기억 명령\n")
-	if !ok {
-		return body
-	}
-	if i := strings.Index(rest, "\n#"); i >= 0 {
-		return before + rest[i:]
-	}
-	return before + "\n"
-}
-
-// Find ranks documents by how many of the words they hold, rarer words counting more,
-// and shows the line that holds the most of them. Ties go to the newer file.
+// Find ranks the records and notes holding the query's words; see searchIndex.search.
 func Find(query string, limit int) []Hit {
-	return findDocuments(query, limit, documents())
+	return newIndex(documents()).search(query, limit, time.Now(), nil)
 }
 
-func findDocuments(query string, limit int, docs []Hit) []Hit {
-	words := terms(query)
-	if len(words) == 0 || len(docs) == 0 {
-		return nil
-	}
-	weight := map[string]float64{}
-	for _, w := range words {
-		df := 0
-		for _, d := range docs {
-			if strings.Contains(strings.ToLower(d.body), w) {
-				df++
-			}
-		}
-		weight[w] = math.Log(1 + float64(len(docs))/float64(df+1))
-	}
-	var hits []Hit
-	for _, d := range docs {
-		lower := strings.ToLower(d.body)
-		for _, w := range words {
-			if n := strings.Count(lower, w); n > 0 {
-				d.Score += weight[w] * (1 + math.Log(float64(n)))
-				if strings.Contains(strings.ToLower(d.Title), w) {
-					d.Score += weight[w]
-				}
-			}
-		}
-		if d.Score == 0 {
-			continue
-		}
-		best := 0
-		for _, line := range strings.Split(d.body, "\n") {
-			count := 0
-			for _, w := range words {
-				if strings.Contains(strings.ToLower(line), w) {
-					count++
-				}
-			}
-			if count > best {
-				best, d.Line = count, strings.TrimSpace(line)
-			}
-		}
-		hits = append(hits, d)
-	}
-	sort.SliceStable(hits, func(i, j int) bool {
-		if hits[i].Score != hits[j].Score {
-			return hits[i].Score > hits[j].Score
-		}
-		return hits[i].mod.After(hits[j].mod)
-	})
-	return hits[:min(limit, len(hits))]
+// FindFilter narrows a find to one repository and to documents touched since a day.
+type FindFilter struct {
+	Repo  string
+	Since time.Time
 }
 
-// FindText is the command output: one hit per line, path · title · matching line.
-func FindText(query string, limit int) string {
-	hits := Find(query, limit)
+func (f FindFilter) keep(h Hit) bool {
+	if f.Repo != "" && !strings.Contains(strings.ToLower(h.repo+" "+h.Path), strings.ToLower(f.Repo)) {
+		return false
+	}
+	return f.Since.IsZero() || !h.mod.Before(f.Since)
+}
+
+// FindText is the command output: one hit per line, path · title · [tier] matching line, then
+// where the line came from.
+func FindText(query string, limit int, filter FindFilter) string {
+	hits := newIndex(documents()).search(query, limit, time.Now(), filter.keep)
 	if len(hits) == 0 {
 		return "찾은 기록 없음 — 다른 말로 다시 찾거나, 원본은 `harness recall source <세션 앞 8자리> <말>` 로 본다"
 	}
 	var lines []string
 	for _, h := range hits {
-		line := fmt.Sprintf("%s · %s · %s", h.Path, h.Title, cut(h.Line, 160))
+		line := fmt.Sprintf("%s · %s · [%s]", h.Path, h.Title, h.Tier)
+		if h.Line != "" {
+			line += " " + cut(h.Line, 160)
+		}
 		if id := header([]byte(h.text), "session"); id != "" {
 			line += " · 원문 세션 " + id
+		}
+		if strings.HasPrefix(h.Ref, "요청 ") {
+			line += " · " + h.Ref
 		}
 		lines = append(lines, line)
 	}
@@ -199,6 +163,7 @@ type Question struct {
 	Sessions []string `json:"expect_sessions"`
 	Note     string   `json:"expect_note"`
 	Keywords []string `json:"keywords"`
+	AskedAt  string   `json:"asked_at"` // UTC, to the minute
 }
 
 type evalHit struct {
@@ -211,6 +176,8 @@ type evalResult struct {
 	ID              string    `json:"id"`
 	KeywordHit      bool      `json:"keyword_hit"`
 	QuestionHit     bool      `json:"question_hit"`
+	KeywordRank     int       `json:"keyword_rank,omitempty"` // 1-based place of the first right result
+	QuestionRank    int       `json:"question_rank,omitempty"`
 	KeywordResults  []evalHit `json:"keyword_results"`
 	QuestionResults []evalHit `json:"question_results"`
 }
@@ -254,10 +221,10 @@ func evalIdentity(id string, aliases map[string]string) string {
 	return id
 }
 
-func evalMatches(q Question, hits []Hit, aliases map[string]string) (bool, []evalHit) {
-	found := false
+func evalMatches(q Question, hits []Hit, aliases map[string]string) (int, []evalHit) {
+	rank := 0
 	results := make([]evalHit, 0, len(hits))
-	for _, h := range hits {
+	for i, h := range hits {
 		id := evalSession(h)
 		matched := q.Note != "" && h.Path == q.Note
 		if canonical := evalIdentity(id, aliases); canonical != "" {
@@ -265,14 +232,17 @@ func evalMatches(q Question, hits []Hit, aliases map[string]string) (bool, []eva
 				matched = matched || canonical == evalIdentity(expected, aliases)
 			}
 		}
-		found = found || matched
+		if matched && rank == 0 {
+			rank = i + 1
+		}
 		results = append(results, evalHit{Path: h.Path, Session: id, Matched: matched})
 	}
-	return found, results
+	return rank, results
 }
 
 // Eval counts the questions whose expected session or note shows up in the top five results,
-// once with keywords and once with the question. A retrieval hit does not verify a decision.
+// once with keywords and once with the question, with how many came first and the mean reciprocal
+// rank. A retrieval hit does not verify a decision.
 func Eval(path string) (map[string]any, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -283,27 +253,49 @@ func Eval(path string) (map[string]any, error) {
 		return nil, err
 	}
 	docs := documents()
+	ix := newIndex(docs)
 	aliases := evalAliases(docs)
-	keywordHits, questionHits := 0, 0
-	var keywordMissed, questionMissed []string
+	now := time.Now()
+	type tally struct {
+		hits, first int
+		reciprocal  float64
+		missed      []string
+	}
+	var keyword, question tally
+	count := func(t *tally, id string, rank int) {
+		if rank == 0 {
+			t.missed = append(t.missed, id)
+			return
+		}
+		t.hits++
+		t.reciprocal += 1 / float64(rank)
+		if rank == 1 {
+			t.first++
+		}
+	}
 	results := make([]evalResult, 0, len(questions))
 	for _, q := range questions {
-		keywordHit, keywordResults := evalMatches(q, findDocuments(strings.Join(q.Keywords, " "), 5, docs), aliases)
-		questionHit, questionResults := evalMatches(q, findDocuments(q.Question, 5, docs), aliases)
-		if keywordHit {
-			keywordHits++
-		} else {
-			keywordMissed = append(keywordMissed, q.ID)
+		// A question is searched as of when it was asked: later conversations, the asking one
+		// included, were not there to be found and often repeat the answer.
+		var keep func(Hit) bool
+		if asked, err := time.Parse("2006-01-02T15:04", q.AskedAt); err == nil {
+			keep = func(h Hit) bool { return h.start.IsZero() || h.start.Before(asked) }
 		}
-		if questionHit {
-			questionHits++
-		} else {
-			questionMissed = append(questionMissed, q.ID)
-		}
-		results = append(results, evalResult{q.ID, keywordHit, questionHit, keywordResults, questionResults})
+		keywordRank, keywordResults := evalMatches(q, ix.search(strings.Join(q.Keywords, " "), 5, now, keep), aliases)
+		questionRank, questionResults := evalMatches(q, ix.search(q.Question, 5, now, keep), aliases)
+		count(&keyword, q.ID, keywordRank)
+		count(&question, q.ID, questionRank)
+		results = append(results, evalResult{q.ID, keywordRank > 0, questionRank > 0, keywordRank, questionRank, keywordResults, questionResults})
 	}
-	return map[string]any{"questions": len(questions), "keyword_hits": keywordHits, "question_hits": questionHits,
-		"keyword_missed": keywordMissed, "question_missed": questionMissed, "results": results}, nil
+	mrr := func(t tally) float64 {
+		if len(questions) == 0 {
+			return 0
+		}
+		return math.Round(t.reciprocal/float64(len(questions))*1000) / 1000
+	}
+	return map[string]any{"questions": len(questions), "keyword_hits": keyword.hits, "question_hits": question.hits,
+		"keyword_hit1": keyword.first, "question_hit1": question.first, "keyword_mrr": mrr(keyword), "question_mrr": mrr(question),
+		"keyword_missed": keyword.missed, "question_missed": question.missed, "results": results}, nil
 }
 
 func flatText(v any) string {

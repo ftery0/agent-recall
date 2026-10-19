@@ -89,7 +89,7 @@ func TestRecordKeepsAnswersEndingCompactionAndCommitSubject(t *testing.T) {
 	if strings.Contains(text, "continued from a previous") || strings.Contains(text, "If you need specific") {
 		t.Fatal("compaction framing kept", text)
 	}
-	if _, ok := previousSummary([]byte(text)); ok {
+	if _, ok := summaryOf([]byte(text)); ok {
 		t.Fatal("quoted compaction headings read back as a model summary", text)
 	}
 	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)); err != nil || out["written"] != 1 {
@@ -194,7 +194,7 @@ func TestModelBuildUpdatesActiveFixedFieldsWithoutCallingModel(t *testing.T) {
 		t.Fatal(out, err, calls)
 	}
 	raw, _ := os.ReadFile(dest)
-	kept, ok := previousSummary(raw)
+	kept, ok := summaryOf(raw)
 	if !ok || kept.Title != old.Title || len(kept.Decisions) != 1 || kept.Decisions[0].Why != old.Decisions[0].Why || kept.Todo[0] != old.Todo[0] || !strings.Contains(string(raw), "최근 추가 결정도 보존해줘") || header(raw, "summary_cursor") != strconv.Itoa(len(fragments(s))) || header(raw, "summary_state") != "pending" {
 		t.Fatal("active fixed update lost prior state or cursor", string(raw))
 	}
@@ -262,7 +262,7 @@ func TestOldReadyRecordStaysUntouchedThenCapturesNewActivity(t *testing.T) {
 		t.Fatal("old ready record did not discover its new content", out, err, calls)
 	}
 	after, _ := os.ReadFile(dest)
-	kept, ok := previousSummary(after)
+	kept, ok := summaryOf(after)
 	if !ok || kept.Title != old.Title || kept.Todo[0] != old.Todo[0] || !strings.Contains(string(after), "한 달 전 작업의 새 요청") || header(after, "summary_state") != "ready" {
 		t.Fatal(string(after))
 	}
@@ -285,7 +285,7 @@ func TestOldReadyRecordDetectsSameSizeRewriteWithoutNewTimestamp(t *testing.T) {
 		t.Fatal("historical same-size source rewrite not discovered", out, err)
 	}
 	after, _ := os.ReadFile(dest)
-	kept, ok := previousSummary(after)
+	kept, ok := summaryOf(after)
 	if !ok || kept.Todo[0] != "보류한 확인" || !strings.Contains(string(after), "푸터 숨김") || header(after, "raw_sha256") == s.hash {
 		t.Fatal("source rewrite or previous state lost", string(after))
 	}
@@ -333,7 +333,8 @@ func TestFindRanksRecordAndEvalCounts(t *testing.T) {
 	Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
 	write(t, filepath.Join(vault, "personal", "10_프로젝트", "_미분류", "작업 기록", "다른.md"), "# 다른 일\n결제 화면\n")
 	hits := Find("헤더를 숨김", 5)
-	if len(hits) != 1 || !strings.Contains(hits[0].Path, "abcdef12") || !strings.Contains(hits[0].Line, "헤더") {
+	// The only request is the title, so no line repeats it.
+	if len(hits) != 1 || !strings.Contains(hits[0].Path, "abcdef12") || !strings.Contains(hits[0].Title, "헤더") || hits[0].Line != "" {
 		t.Fatal(hits)
 	}
 	questions := filepath.Join(t.TempDir(), "q.json")
@@ -506,6 +507,44 @@ func TestALookupWrittenInsideAHeredocIsNotRun(t *testing.T) {
 	}
 }
 
+func TestOnlyACommitRunOutsideQuotesIsACommit(t *testing.T) {
+	for shell, want := range map[string]bool{
+		`git commit -m "fix: a"`:                   true,
+		`git -C ~/other commit -m x`:               true,
+		`git -c user.name=t -C "/a b" commit -m x`: true,
+		`rg -n "git commit" .`:                     false,
+		`echo 'git commit -m x' && git status`:     false,
+		`git log --grep="commit"`:                  false,
+	} {
+		if got := runsCommit(shellOnly(shell)); got != want {
+			t.Errorf("%s: got %v", shell, got)
+		}
+	}
+	if runsCommit(shellOnly("cat > a.md <<'EOF'\ngit commit -m x\nEOF")) {
+		t.Fatal("heredoc 안의 글을 커밋으로 봄")
+	}
+	for command, want := range map[string]string{
+		`git -C "/a b" commit -m "fix: 제목"`:                             "fix: 제목",
+		`git -c user.name=t -c user.email=t@t commit -qm init && cd /x`: "init",
+		"git commit -F - -m \"$(cat <<'EOF'\nfix: 여러 줄\n\n본문\nEOF\n)\"": "fix: 여러 줄",
+	} {
+		if got := commitSubjects(command); len(got) != 1 || got[0] != want {
+			t.Errorf("%s: got %q, want %q", command, got, want)
+		}
+	}
+}
+
+func TestALongRunOfChecksKeepsTheCommit(t *testing.T) {
+	s := session{id: "s", cwd: "/w", commands: []command{{text: `git commit -m "fix: 먼저"`, source: "tool:c", result: "성공"}}}
+	for i := range 20 {
+		s.commands = append(s.commands, command{text: fmt.Sprintf("pnpm test %d", i), source: "tool:t", result: "성공"})
+	}
+	text := render(s, summary{}, false)
+	if !strings.Contains(text, "### 커밋\n- fix: 먼저 → 성공 [tool:c]") || strings.Contains(text, "pnpm test 4`") || !strings.Contains(text, "pnpm test 19`") {
+		t.Fatal("검사가 많으면 앞선 커밋이 기록에서 밀려남", text)
+	}
+}
+
 func TestRecordKeepsHowEachMemoryLookupCameBack(t *testing.T) {
 	claude, codex := lookupSessions(t)
 	at := func(minute int) string {
@@ -528,5 +567,30 @@ func TestRecordKeepsHowEachMemoryLookupCameBack(t *testing.T) {
 	want = "### 기억 명령\n- " + at(1) + " `rtk harness recall day 2026-10-15 web_app` → 빈 결과 [tool:c1]\n- " + at(3) + " `rtk harness recall find 'TSK-1344'` → 빈 결과 [tool:c2#1]\n- " + at(5) + " `harness recall day 10/15` → 오류 [tool:c3#0]\n- " + at(7) + " `rtk proxy harness recall find rsi` → 결과 있음 [tool:c4#0]\n- " + at(9) + " `rtk harness recall source 01a0 --limit 10` → 빈 결과 [tool:c5#1]\n- " + at(11) + " `rtk proxy harness recall source 01a11bf3 --limit 4` → 오류 [tool:c6#0]\n"
 	if !strings.Contains(text, want) || strings.Contains(text, "rtk cat a.md") || strings.Contains(text, "rtk cat b.md") {
 		t.Fatalf("missing %q, or a script command that is no lookup was kept\n%s", want, text)
+	}
+}
+
+func TestRecordReadsChecksOutsideHeredocsOnceAndMarksPipelines(t *testing.T) {
+	_, _, path := recordFixture(t)
+	at := func(minute int) string { return time.Date(2026, 10, 7, 1, minute, 0, 0, time.UTC).Format(time.RFC3339) }
+	human := recordHuman("first", "검사 돌려줘", time.Date(2026, 10, 7, 1, 0, 0, 0, time.UTC))
+	human["sessionId"], human["cwd"] = "abcdef12-0000-0000-0000-000000000000", "/work/repo"
+	use := func(id, command string, minute int) map[string]any {
+		return map[string]any{"type": "assistant", "timestamp": at(minute), "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": id, "name": "Bash", "input": map[string]any{"command": command}}}}}
+	}
+	result := func(id string, minute int) map[string]any {
+		return map[string]any{"type": "user", "timestamp": at(minute), "message": map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": id, "is_error": false}}}}
+	}
+	write(t, path, jsonLines(t, human,
+		use("n1", "cat > note.md <<'EOF'\npnpm test 는 나중에\nEOF", 1), result("n1", 2),
+		use("p1", "go test ./... | tail -3", 3), use("p1", "go test ./... | tail -3", 3), result("p1", 4),
+		use("v1", "go vet ./... || true", 5), result("v1", 6),
+	))
+	s, ok := readSession("claude", path)
+	if !ok || len(s.commands) != 2 || s.commands[0].result != "끝 명령 성공" || s.commands[1].result != "성공" {
+		t.Fatal("heredoc 속 말을 검사로 읽었거나, 같은 호출을 두 번 셌거나, 파이프 끝 결과를 성공으로 적음", ok, s.commands)
+	}
+	if text, _ := sourceText(s, "tool:p1"); text != "" {
+		t.Fatal("파이프 끝 명령 결과를 검사 근거로 씀", text)
 	}
 }

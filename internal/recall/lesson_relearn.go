@@ -171,18 +171,20 @@ func readLessonRecords(input *lessonInputs) ([]lessonRecord, error) {
 	}
 	var records []lessonRecord
 	for _, path := range paths {
+		// Read through the inputs, not loadRecords: the preview's token covers exactly these bytes.
 		raw, err := input.read(path, false)
 		if err != nil || raw == nil {
 			return nil, fmt.Errorf("교훈 기록 읽기 미완료: %s", path)
 		}
-		id := header(raw, "session")
+		rec := record{path: path, raw: raw, head: frontMatter(raw)}
+		id := rec.field("session")
 		if id == "" {
 			id = "record:" + path
 		}
-		source := LessonSource{Record: path, Raw: header(raw, "raw"), Basis: "미확인"}
+		source := LessonSource{Record: path, Raw: rec.field("raw"), Basis: "미확인"}
 		if fullSessionID.MatchString(id) {
 			source.Session, source.Basis = id, "기록 세션"
-			source.SessionStart = validLessonDay(header(raw, "date"))
+			source.SessionStart = validLessonDay(rec.field("date"))
 		}
 		if source.Raw != "" {
 			meta, err := input.read(source.Raw, true)
@@ -201,8 +203,8 @@ func readLessonRecords(input *lessonInputs) ([]lessonRecord, error) {
 				}
 			}
 		}
-		m, _ := previousSummary(raw)
-		records = append(records, lessonRecord{source: source, scope: header(raw, "repo"), rules: m.Lessons, id: id})
+		m, _ := rec.summary()
+		records = append(records, lessonRecord{source: source, scope: rec.field("repo"), rules: m.Lessons, id: id})
 	}
 	return records, nil
 }

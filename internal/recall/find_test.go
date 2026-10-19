@@ -169,3 +169,27 @@ func TestFindSkipsTheLookupsAgentsRan(t *testing.T) {
 		t.Fatal("AI가 부른 기억 명령이 찾기 결과에 나옴", hits[0].Line)
 	}
 }
+
+func TestEvalSearchesOnlyRecordsStartedBeforeTheQuestion(t *testing.T) {
+	recordFixture(t)
+	morning, evening := "11111111-0000-4000-8000-000000000001", "22222222-0000-4000-8000-000000000002"
+	for id, at := range map[string]string{morning: "09:00", evening: "18:00"} {
+		write(t, filepath.Join(RecordDir(), "2026-10-08", id[:8]+".md"), "---\nsession: "+id+"\ndate: 2026-10-08\ntime: "+at+"-"+at+"\n---\n# 시점 자료\n시점검색\n")
+	}
+	// Asked at noon: the morning record existed, the evening one did not yet.
+	asked := time.Date(2026, 10, 8, 12, 0, 0, 0, time.Local).UTC().Format("2006-01-02T15:04")
+	questions := filepath.Join(t.TempDir(), "q.json")
+	write(t, questions, `[{"id":"before","question":"시점검색 뭐였지","keywords":["시점검색"],"expect_sessions":["`+morning+`"],"asked_at":"`+asked+`"},`+
+		`{"id":"after","question":"시점검색 뭐였지","keywords":["시점검색"],"expect_sessions":["`+evening+`"],"asked_at":"`+asked+`"},`+
+		`{"id":"no-time","question":"시점검색 뭐였지","keywords":["시점검색"],"expect_sessions":["`+evening+`"]}]`)
+	out, err := Eval(questions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"before": true, "after": false, "no-time": true}
+	for _, r := range out["results"].([]evalResult) {
+		if r.KeywordHit != want[r.ID] || r.QuestionHit != want[r.ID] {
+			t.Errorf("%s: keyword %v question %v, want %v", r.ID, r.KeywordHit, r.QuestionHit, want[r.ID])
+		}
+	}
+}

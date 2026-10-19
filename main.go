@@ -140,7 +140,7 @@ func run(args []string) (any, error) {
 	}
 	if args[0] == "recall" {
 		if len(args) < 2 {
-			return nil, errors.New("use: recall sweep|verify|find|day|source|misses|eval|build|sync")
+			return nil, errors.New("use: recall sweep|verify|find|day|source|facts|misses|eval|build|sync")
 		}
 		if len(args) == 2 && args[1] == "sweep" {
 			return recall.Sweep()
@@ -149,7 +149,22 @@ func run(args []string) (any, error) {
 			return recall.Verify()
 		}
 		if len(args) >= 2 && args[1] == "find" {
-			return recall.FindText(strings.Join(args[2:], " "), 5), nil
+			f := flag.NewFlagSet("find", flag.ContinueOnError)
+			repo := f.String("repo", "", "only this repository")
+			since := f.String("since", "", "only from this day (YYYY-MM-DD)")
+			limit := f.Int("limit", 5, "result count")
+			if err := f.Parse(flagsFirst(args[2:], "repo", "since", "limit")); err != nil {
+				return nil, err
+			}
+			filter := recall.FindFilter{Repo: *repo}
+			if *since != "" {
+				day, err := time.ParseInLocation("2006-01-02", *since, time.Local)
+				if err != nil {
+					return nil, fmt.Errorf("--since 는 YYYY-MM-DD 로 쓴다: %q", *since)
+				}
+				filter.Since = day
+			}
+			return recall.FindText(strings.Join(f.Args(), " "), *limit, filter), nil
 		}
 		if len(args) >= 3 && args[1] == "day" {
 			return recall.DayText(args[2], strings.Join(args[3:], " "), 8, time.Now())
@@ -163,6 +178,20 @@ func run(args []string) (any, error) {
 				return nil, err
 			}
 			return recall.SourcePage(args[2], strings.Join(f.Args(), " "), *id, *offset, *limit)
+		}
+		if args[1] == "facts" {
+			f := flag.NewFlagSet("facts", flag.ContinueOnError)
+			review := f.Bool("review", false, "AI proposals and conflicts waiting on the person")
+			online := f.Bool("online", false, "also ask GitHub about pull requests")
+			backfill := f.Bool("backfill", false, "read every recorded conversation again for its facts")
+			limit := f.Int("limit", 20, "fact count")
+			if err := f.Parse(flagsFirst(args[2:], "limit")); err != nil {
+				return nil, err
+			}
+			if *backfill {
+				return recall.BackfillFacts(time.Now())
+			}
+			return recall.FactsText(strings.Join(f.Args(), " "), *review, *online, *limit)
 		}
 		if args[1] == "misses" {
 			m := flag.NewFlagSet("misses", flag.ContinueOnError)
@@ -255,67 +284,6 @@ func promptHook(payload memory.Object, now time.Time) any {
 	return out
 }
 
-// startCard is read-only; the caller starts collection independently.
-func startCard(tool string, payload memory.Object) string {
-	cwd := memory.Text(payload["cwd"])
-	transcript := memory.Text(payload["transcript_path"])
-	// A new conversation is named before its first line is written; that is not a failed lookup.
-	if source := memory.Text(payload["source"]); source == "startup" || source == "clear" {
-		if _, err := os.Stat(transcript); os.IsNotExist(err) {
-			transcript = ""
-		}
-	}
-	core, err := recall.ResumeText(cwd, transcript)
-	copy := memory.Object{}
-	for k, v := range payload {
-		copy[k] = v
-	}
-	if core != "" {
-		copy["recall_context"] = true
-	}
-	base := worklog.Start(tool, copy)
-	var parts []string
-	// The existing compact language line stays at the top.
-	if strings.HasPrefix(base, "=== 압축·이어 열기 뒤다.") {
-		first, rest, _ := strings.Cut(base, "\n")
-		parts = append(parts, first)
-		base = rest
-	}
-	if core != "" {
-		parts = append(parts, core)
-	}
-	if err != nil {
-		parts = append(parts, "기억 조회 미완료: "+cardExcerpt(err.Error(), 220))
-	}
-	var extra []string
-	if core != "" || base != "" {
-		lessons := recall.CardLines(cwd)
-		// Reserve source lookup and collection failures before optional context.
-		parts = append(parts, lessons[len(lessons)-1])
-		extra = append(extra, lessons[:len(lessons)-1]...)
-		if warning := recall.SyncWarning(); warning != "" {
-			parts = append(parts, cardExcerpt(warning, 250))
-		}
-	}
-	extra = append(extra, strings.Split(base, "\n")...)
-	const omitted = "시작 카드에 생략된 내용은 원본 기록과 recall find로 확인한다."
-	skipped := false
-	for _, line := range extra {
-		if line != "" && len([]rune(strings.Join(parts, "\n")+"\n"+line+"\n"+omitted)) <= 3000 {
-			parts = append(parts, line)
-		} else if line != "" {
-			skipped = true
-			if len(parts) > 0 && strings.HasPrefix(parts[len(parts)-1], "=== 배운 것") {
-				parts = parts[:len(parts)-1]
-			}
-		}
-	}
-	if skipped {
-		parts = append(parts, omitted)
-	}
-	return strings.Join(parts, "\n")
-}
-
 // flagsFirst moves flags ahead of the words, so "source ID 말 --limit 2" reads like
 // "source ID --limit 2 말"; the flag package stops at the first word and would drop the rest.
 func flagsFirst(args []string, valued ...string) []string {
@@ -339,12 +307,6 @@ func flagsFirst(args []string, valued ...string) []string {
 	return append(append(flags, "--"), words...)
 }
 
-func cardExcerpt(s string, limit int) string {
-	if runes := []rune(s); len(runes) > limit {
-		return string(runes[:limit]) + "…"
-	}
-	return s
-}
 func main() {
 	result, e := run(os.Args[1:])
 	if e != nil {

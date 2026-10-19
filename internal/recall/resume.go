@@ -2,13 +2,12 @@ package recall
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/ftery0/agent-recall/internal/worklog"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -21,6 +20,8 @@ type resumeRecord struct {
 	m                              summary
 	when                           time.Time
 	requests                       []worklog.Request
+	files                          []string // what the conversation changed, from its record
+	ended                          time.Time
 	last                           string // the agent's answer to the last request, read from the transcript
 	rawError                       bool
 }
@@ -32,7 +33,11 @@ func transcriptMetadata(path string) (cwd, id string, err error) {
 		return "", "", err
 	}
 	defer f.Close()
-	scan := bufio.NewScanner(f)
+	return transcriptMetadataReader(f)
+}
+
+func transcriptMetadataReader(reader io.Reader) (cwd, id string, err error) {
+	scan := bufio.NewScanner(reader)
 	scan.Buffer(make([]byte, 4096), 64<<20)
 	for i := 0; i < 32 && scan.Scan(); i++ {
 		var row map[string]any
@@ -63,16 +68,6 @@ func transcriptMetadata(path string) (cwd, id string, err error) {
 		}
 	}
 	return cwd, id, scan.Err()
-}
-
-func gitFolder(cwd string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	raw, err := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return ""
-	}
-	return filepath.Clean(strings.TrimSpace(string(raw)))
 }
 
 func unfinished(m summary, state string) bool {
@@ -181,7 +176,8 @@ func requestView(requests []worklog.Request, count, budget int) string {
 		if room < 16 {
 			break
 		}
-		b.WriteString(prefix + requestExcerpt(r, min(110, room)) + "\n")
+		// An excerpt cut short ends with one more rune, "…".
+		b.WriteString(prefix + requestExcerpt(r, min(110, room-1)) + "\n")
 		if r.QuestionID == "" && len([]rune(r.Text)) <= 16 && r.Context != "" {
 			line := "    보조 문맥(AI 주장): " + cut(strings.ReplaceAll(mask(r.Context), "\n", " "), 60) + "\n"
 			if len([]rune(b.String()+line)) <= budget {
@@ -206,12 +202,21 @@ func recordView(record resumeRecord, budget int) string {
 		heading += " (처음 요청 — 지금 일은 아래 최신 원문)"
 	}
 	appendViewLine(&b, heading, budget)
+	ending, check := "", cut(sessionCheck(record.session, record.cwd, record.files, record.ended, time.Now()), 200)
+	if record.last != "" {
+		ending = "  끝난 지점(AI 주장): " + gist(record.last, 120)
+	}
 	if len(record.requests) > 0 {
 		appendViewLine(&b, "  이전 사용자 원문(최신부터, 아래 요약보다 우선):", budget)
-		b.WriteString(requestView(record.requests, 4, min(max(0, budget-len([]rune(b.String()))), budget*3/5)))
+		// The requests leave room for where the conversation stopped and what git says of it now.
+		room := budget - len([]rune(b.String()+ending+check)) - 2
+		b.WriteString(requestView(record.requests, 4, min(max(0, room), budget*3/5)))
 	}
-	if record.last != "" {
-		appendViewLine(&b, "  끝난 지점(AI 주장): "+gist(record.last, 120), budget)
+	if ending != "" {
+		appendViewLine(&b, ending, budget)
+	}
+	if check != "" {
+		appendViewLine(&b, check, budget)
 	}
 	if record.rawError {
 		appendViewLine(&b, "  원문 조회 미확정: 이전 요약의 해석을 원문으로 확인한다.", budget)
@@ -257,7 +262,7 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 		return "", nil
 	}
 	cwd = filepath.Clean(cwd)
-	root := gitFolder(cwd)
+	root := worklog.RepoRoot(cwd)
 	roots := map[string]string{cwd: root}
 	matchesFolder := func(other string) bool {
 		if other == "" {
@@ -272,56 +277,39 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 		}
 		otherRoot, ok := roots[other]
 		if !ok {
-			otherRoot = gitFolder(other)
+			otherRoot = worklog.RepoRoot(other)
 			roots[other] = otherRoot
 		}
 		return otherRoot == root
 	}
-	paths, err := filepath.Glob(filepath.Join(RecordDir(), "*", "*.md"))
-	if err != nil {
-		return "", err
-	}
+	stored, readErrors := loadRecords()
 	var records []resumeRecord
-	var readErrors []error
 	knownRaw := map[string]bool{}
-	for _, path := range paths {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			readErrors = append(readErrors, err)
-			continue
-		}
-		rawPath := header(raw, "raw")
+	for _, rec := range stored {
+		rawPath := rec.field("raw")
 		knownRaw[rawPath] = true
-		folder := header(raw, "cwd")
-		if unquoted, err := strconv.Unquote(folder); err == nil {
-			folder = unquoted
-		}
+		folder := rec.cwd()
 		if folder == "" {
 			folder, _, _ = transcriptMetadata(rawPath)
 		}
 		if !matchesFolder(folder) {
 			continue
 		}
-		m, _ := previousSummary(raw)
+		m, _ := rec.summary()
 		if m.Title == "" {
-			m.Title = title(string(raw), filepath.Base(path))
+			m.Title = rec.title()
 		}
-		state := header(raw, "summary_state")
-		info, err := os.Stat(path)
-		if err != nil {
-			readErrors = append(readErrors, err)
-			continue
-		}
-		when := recordTime(raw, info.ModTime())
+		state := rec.field("summary_state")
+		when := rec.ended()
 		if rawInfo, err := os.Stat(rawPath); err == nil {
-			size, sizeErr := strconv.ParseInt(header(raw, "raw_bytes"), 10, 64)
-			if (sizeErr == nil && rawInfo.Size() != size) || rawInfo.ModTime().After(info.ModTime()) {
+			size, sizeErr := strconv.ParseInt(rec.field("raw_bytes"), 10, 64)
+			if (sizeErr == nil && rawInfo.Size() != size) || rawInfo.ModTime().After(rec.mod) {
 				state = "pending"
 				when = lastActive(rawPath)
 			}
 		}
 		if unfinished(m, state) {
-			records = append(records, resumeRecord{path: path, raw: rawPath, session: header(raw, "session"), cwd: folder, state: state, m: m, when: when})
+			records = append(records, resumeRecord{path: rec.path, raw: rawPath, session: rec.field("session"), files: rec.items("바뀐 파일"), ended: rec.ended(), cwd: folder, state: state, m: m, when: when})
 		}
 	}
 	// Stop archives immediately; the summary collector may not have run yet. Inspect only
@@ -375,7 +363,16 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 			records = append(records, resumeRecord{raw: path, session: id, cwd: folder, state: "pending", m: summary{Title: "최근 대화(기록 전)"}, when: lastActive(path)})
 		}
 	}
-	sort.SliceStable(records, func(i, j int) bool { return records[i].when.After(records[j].when) })
+	// The conversation open now leads, so its input is not read as the next record's work.
+	current := func(r resumeRecord) bool {
+		return (transcriptPath != "" && r.raw == transcriptPath) || (currentSession != "" && r.session == currentSession)
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		if a, b := current(records[i]), current(records[j]); a != b {
+			return a
+		}
+		return records[i].when.After(records[j].when)
+	})
 	var requests []worklog.Request
 	if transcriptPath != "" {
 		if matchesFolder(currentFolder) || currentFolder == "" {
@@ -395,12 +392,17 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 	}
 	totalCandidates := len(records)
 	var visible []resumeRecord
+	shownSessions := map[string]bool{}
 	for _, record := range records {
 		if len(visible) == 2 {
 			break
 		}
-		if record.raw == transcriptPath || (currentSession != "" && record.session == currentSession) {
-			visible = append(visible, record)
+		// Codex can keep one conversation in two files; the newest stands for it.
+		if record.session != "" && shownSessions[record.session] {
+			continue
+		}
+		if current(record) {
+			visible, shownSessions[record.session] = append(visible, record), true
 			continue
 		}
 		prior, reports, err := worklog.ReadConversation(record.raw)
@@ -416,7 +418,7 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 		if record.path == "" {
 			record.m.Title = requestTitle(prior) // not recorded yet: name it by what the person typed
 		}
-		visible = append(visible, record)
+		visible, shownSessions[record.session] = append(visible, record), true
 	}
 	records = visible
 	if len(records) == 0 && len(requests) == 0 {
@@ -463,6 +465,9 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 		b.WriteString(requestView(requests, 6, max(0, budget)))
 	}
 	for i, record := range records {
+		if i > 0 && current(records[i-1]) && !current(record) {
+			b.WriteString("같은 폴더의 다른 대화(지금 대화 아님):\n")
+		}
 		budget := (2000 - len([]rune(b.String()+footer.String()))) / (len(records) - i)
 		b.WriteString(recordView(record, max(0, budget)))
 	}

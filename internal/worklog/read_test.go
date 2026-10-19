@@ -269,3 +269,24 @@ func TestReadConversationReportsOpenAndScannerFailures(t *testing.T) {
 		t.Fatalf("scanner failure not reported: %v", err)
 	}
 }
+
+func TestRepoRootFindsTheGitFolderOrAWorktreesGitFile(t *testing.T) {
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, worktree, plain := filepath.Join(parent, "repo"), filepath.Join(parent, "wt"), filepath.Join(parent, "plain")
+	for _, dir := range []string{filepath.Join(repo, ".git"), filepath.Join(repo, "a", "b"), worktree, plain} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+repo+"/.git/worktrees/wt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for dir, want := range map[string]string{filepath.Join(repo, "a", "b"): repo, worktree: worktree, plain: "", filepath.Join(parent, "gone"): "", "": ""} {
+		if got := RepoRoot(dir); got != want {
+			t.Errorf("%q: got %q, want %q", dir, got, want)
+		}
+	}
+}

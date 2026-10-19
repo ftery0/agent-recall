@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -71,26 +72,68 @@ func dailyDir() string {
 	return filepath.Join(VaultDir(), "company", "00_기록", "데일리")
 }
 
-func git(dir string, args ...string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+const gitWait = 3 * time.Second
+
+// Git runs git in dir within limit and gives its output without the final newline, or false
+// when git failed or ran too long. The start card, the notes and recall's checks all call git here.
+// An empty dir is refused: git -C with an empty path reads whatever repository this process runs in.
+func Git(dir string, limit time.Duration, args ...string) (string, bool) {
+	if dir == "" {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
 	defer cancel()
 	raw, err := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...).Output()
 	if err != nil {
+		return "", false
+	}
+	return strings.TrimRight(string(raw), "\n"), true
+}
+
+// RepoRoot is the top folder of the git repository holding dir, or "" outside one. It looks for the
+// ".git" folder, or a worktree's ".git" file, itself: the start card asks this of every recorded
+// folder, and a git process for each took most of the card's time.
+func RepoRoot(dir string) string {
+	if dir == "" {
 		return ""
 	}
-	return strings.TrimRight(string(raw), "\n")
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return ""
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// OriginName is the repository name in dir's origin URL, or "" without one.
+func OriginName(dir string) string {
+	if origin, _ := Git(dir, gitWait, "remote", "get-url", "origin"); origin != "" {
+		return originName(origin)
+	}
+	return ""
+}
+
+func originName(url string) string {
+	return strings.TrimSuffix(filepath.Base(strings.TrimRight(url, "/")), ".git")
 }
 
 func findRepo(cwd string) repo {
 	r := repo{root: cwd}
-	if top := git(cwd, "rev-parse", "--show-toplevel"); top != "" {
+	if top := RepoRoot(cwd); top != "" {
 		r.root, r.git = top, true
 	}
 	r.names = []string{strings.ToLower(filepath.Base(r.root))}
-	if origin := git(r.root, "remote", "get-url", "origin"); origin != "" {
+	if origin, _ := Git(r.root, gitWait, "remote", "get-url", "origin"); origin != "" {
 		r.company = companyOrigin(origin)
-		name := strings.TrimSuffix(filepath.Base(strings.TrimRight(origin, "/")), ".git")
-		r.names = append(r.names, strings.ToLower(name))
+		r.names = append(r.names, strings.ToLower(originName(origin)))
 	}
 	return r
 }
@@ -141,7 +184,7 @@ func findNotes(vault string, r repo) []note {
 			if m := nextItem.FindStringSubmatch(string(raw)); m != nil {
 				n.next = strings.TrimSpace(m[1])
 			}
-			n.prs = notePRs(string(raw))
+			n.prs = notePRs(string(raw), r.root)
 			notes = append(notes, n)
 			return nil
 		})
@@ -210,21 +253,6 @@ func stamp(v any) time.Time {
 	return t
 }
 
-func flatten(v any) string {
-	if s, ok := v.(string); ok {
-		return spaces.ReplaceAllString(s, " ")
-	}
-	var parts []string
-	items, _ := v.([]any)
-	for _, item := range items {
-		block, _ := item.(map[string]any)
-		if text, ok := block["text"].(string); ok && (block["type"] == "text" || block["type"] == "input_text" || block["type"] == "output_text") {
-			parts = append(parts, text)
-		}
-	}
-	return strings.TrimSpace(spaces.ReplaceAllString(strings.Join(parts, " "), " "))
-}
-
 // humanPrompt is a Claude row the person sent: typed, picked from a suggestion, or queued while
 // the AI worked; "sdk" rows are scripted runs. Claude Code before 2.1.220 did not mark rows at all,
 // so an unmarked row from those versions counts as typed.
@@ -279,33 +307,43 @@ func readTranscript(path string) transcript {
 }
 
 func readTranscriptChecked(path string) (transcript, error) {
-	var t transcript
 	f, err := os.Open(path)
 	if err != nil {
-		return t, err
+		return transcript{}, err
 	}
 	defer f.Close()
+	return readTranscriptReader(f)
+}
+
+func readTranscriptReader(reader io.Reader) (transcript, error) {
+	var t transcript
+	var readErrors []error
 	humanTurn := false
 	lastAssistant := ""
-	seen := map[string]bool{}
+	seen := map[string]string{}
 	type question struct {
 		text      []string
 		assistant string
 	}
 	questions := map[string]question{}
 	request := func(at time.Time, text, id, source, questionID string, line int) {
-		if text == "" || injectedPrompt(text) || seen[id] {
+		if text == "" || injectedPrompt(text) {
 			return
 		}
-		seen[id] = true
+		if previous, exists := seen[id]; exists {
+			if previous != text {
+				readErrors = append(readErrors, fmt.Errorf("read transcript line %d: conflicting human request ID", line))
+			}
+			return
+		}
+		seen[id] = text
 		r := Request{At: at, Text: text, ID: id, Line: line, Source: source, QuestionID: questionID}
 		if questionID == "" {
 			r.Context = lastAssistant
 		}
 		t.requests = append(t.requests, r)
 	}
-	var readErrors []error
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1<<20), 64<<20)
 	line := 0
 	for scanner.Scan() {
@@ -521,8 +559,8 @@ func ReadConversation(path string) ([]Request, []string, error) {
 	return t.requests, t.reports, err
 }
 
-// Conversation keeps the card and search callers compatible; recording uses ReadConversation.
-func Conversation(path string) ([]Request, []string) {
-	requests, reports, _ := ReadConversation(path)
-	return requests, reports
+// ReadConversationReader parses an already captured snapshot without reopening a mutable path.
+func ReadConversationReader(reader io.Reader) ([]Request, []string, error) {
+	t, err := readTranscriptReader(reader)
+	return t.requests, t.reports, err
 }

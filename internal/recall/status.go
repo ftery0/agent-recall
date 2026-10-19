@@ -7,7 +7,6 @@ import (
 	"github.com/ftery0/agent-recall/internal/memory"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -22,54 +21,26 @@ type syncStatus struct {
 // Counts come from the stored records, rather than the failures of this one run. "off" records
 // wait on nothing. Missing old metadata or unreadable records leave the total unknown.
 func storedSummaryCounts() (*int, *int) {
+	records, errs := loadRecords()
+	if len(errs) > 0 {
+		return nil, nil
+	}
 	pending, unresolved := 0, 0
-	_, err := os.Lstat(RecordDir())
-	if os.IsNotExist(err) {
-		return &pending, &unresolved
-	}
-	if err != nil {
-		return nil, nil
-	}
-	days, err := os.ReadDir(RecordDir())
-	if err != nil {
-		return nil, nil
-	}
-	for _, day := range days {
-		if !day.IsDir() {
-			// A file at an expected date-folder path is corruption, not an empty day.
-			if _, err := time.Parse("2006-01-02", day.Name()); err != nil {
-				continue
-			}
+	for _, rec := range records {
+		if rec.field("raw") == "" {
+			continue
 		}
-		folder := filepath.Join(RecordDir(), day.Name())
-		files, err := os.ReadDir(folder)
-		if err != nil {
+		state := rec.field("summary_state")
+		switch state {
+		case "pending", "ready", "failed", "off":
+		default:
 			return nil, nil
 		}
-		for _, file := range files {
-			if !strings.HasSuffix(file.Name(), ".md") {
-				continue
-			}
-			raw, err := os.ReadFile(filepath.Join(folder, file.Name()))
-			if err != nil {
-				return nil, nil
-			}
-			if header(raw, "raw") == "" {
-				continue
-			}
-			state := header(raw, "summary_state")
-			switch state {
-			case "pending", "ready", "failed", "off":
-			default:
-				return nil, nil
-			}
-			if state == "pending" || state == "failed" || header(raw, "lessons_pending") == "true" {
-				pending++
-			}
-			message, _ := summaryDiagnostics(raw)
-			if message != "" {
-				unresolved++
-			}
+		if state == "pending" || state == "failed" || rec.field("lessons_pending") == "true" {
+			pending++
+		}
+		if message, _ := summaryDiagnostics(rec.raw); message != "" {
+			unresolved++
 		}
 	}
 	return &pending, &unresolved

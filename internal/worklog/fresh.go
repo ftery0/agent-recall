@@ -16,6 +16,7 @@ const maxMemoryWarnings = 2
 
 var (
 	prNumber   = regexp.MustCompile(`(?i)\bPR\s*#\s*(\d{1,5})\b`)
+	backendPR  = regexp.MustCompile(`(?i)백엔드|backend|\bBE\b|[-_]be$`)
 	memoryFile = regexp.MustCompile(`[\p{L}\p{N}_.-]+(?:/[\p{L}\p{N}_.-]+)+\.[A-Za-z]{1,5}\b`)
 	folderName = regexp.MustCompile(`[^A-Za-z0-9]`)
 )
@@ -23,17 +24,52 @@ var (
 // PRMerged finds the commit that merged pull request n in the local history: GitHub's merge
 // commit, or a squashed subject ending in "(#n)". A merge not fetched yet is not seen.
 func PRMerged(root, n string) (string, time.Time, bool) {
-	out := git(root, "log", "--all", "-1", "-E", "--format=%h %cI", "--grep=^Merge pull request #"+n+" |\\(#"+n+"\\)$")
+	out, _ := Git(root, gitWait, "log", "--all", "-1", "-E", "--format=%h %cI", "--grep=^Merge pull request #"+n+" |\\(#"+n+"\\)$")
 	hash, when, _ := strings.Cut(out, " ")
 	at, err := time.Parse(time.RFC3339, when)
 	return hash, at, hash != "" && err == nil
 }
 
-func notePRs(text string) []string {
+// PRWord is the word right before a pull request mention, as "백엔드" in "백엔드 PR #104".
+// before is the text ahead of the mention.
+func PRWord(before string) string {
+	fields := strings.Fields(before[strings.LastIndex(before, "\n")+1:])
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.Trim(fields[len(fields)-1], "([{\"'`"), "의"))
+}
+
+// Backend says a word or a repository name means the backend.
+func Backend(name string) bool { return backendPR.MatchString(name) }
+
+// ForeignPR says a pull request mention belongs to another repository: the word right before it
+// is a backend word or a folder name beside root.
+func ForeignPR(before, root string) bool {
+	word := PRWord(before)
+	if word == "" {
+		return false
+	}
+	if Backend(word) {
+		return true
+	}
+	if root == "" {
+		return false
+	}
+	for _, repo := range siblingRepos(root)[1:] {
+		if strings.ToLower(filepath.Base(repo)) == word {
+			return true
+		}
+	}
+	return false
+}
+
+func notePRs(text, root string) []string {
 	var prs []string
-	for _, m := range prNumber.FindAllStringSubmatch(text, -1) {
-		if !slices.Contains(prs, m[1]) && len(prs) < 3 {
-			prs = append(prs, m[1])
+	for _, m := range prNumber.FindAllStringSubmatchIndex(text, -1) {
+		n := text[m[2]:m[3]]
+		if !slices.Contains(prs, n) && len(prs) < 3 && !ForeignPR(text[:m[0]], root) {
+			prs = append(prs, n)
 		}
 	}
 	return prs
@@ -84,7 +120,7 @@ func memoryLines(tool string, payload memory.Object, root string) []string {
 				}
 			}
 			for repo, files := range byRepo {
-				out := git(repo, append([]string{"log", "--all", "--since=" + saved.Format(time.RFC3339), "--format=%h %cI", "--"}, files...)...)
+				out, _ := Git(repo, gitWait, append([]string{"log", "--all", "--since=" + saved.Format(time.RFC3339), "--format=%h %cI", "--"}, files...)...)
 				if out == "" {
 					continue
 				}

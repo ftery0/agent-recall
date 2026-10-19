@@ -22,24 +22,15 @@ func recallTally(since time.Time) (int, map[string]int, []recallMiss) {
 	counts := map[string]int{}
 	var misses []recallMiss
 	total := 0
-	paths, _ := filepath.Glob(filepath.Join(RecordDir(), "*", "*.md"))
-	for _, path := range paths {
-		raw, err := os.ReadFile(path)
-		info, statErr := os.Stat(path)
-		if err != nil || statErr != nil {
+	records, _ := loadRecords()
+	for _, rec := range records {
+		ended := rec.ended()
+		lookups := rec.items("기억 명령")
+		if len(lookups) == 0 || ended.Before(since) {
 			continue
 		}
-		ended := recordTime(raw, info.ModTime())
-		_, section, found := strings.Cut(string(raw), "\n### 기억 명령\n")
-		if !found || ended.Before(since) {
-			continue
-		}
-		started, _ := time.ParseInLocation("2006-01-02", header(raw, "date"), time.Local)
-		for _, line := range strings.Split(section, "\n") {
-			item, ok := strings.CutPrefix(line, "- ")
-			if !ok {
-				break
-			}
+		started, _ := time.ParseInLocation("2006-01-02", rec.field("date"), time.Local)
+		for _, item := range lookups {
 			// A conversation can run for days, so each lookup carries its own time.
 			when := ended
 			if stamp, rest, ok := strings.Cut(item, " `"); ok && len(stamp) == len(requestStamp) {
@@ -59,7 +50,7 @@ func recallTally(since time.Time) (int, map[string]int, []recallMiss) {
 			counts[result]++
 			if result == "빈 결과" || result == "오류" {
 				misses = append(misses, recallMiss{when, fmt.Sprintf("%s %s %s %s · %s → %s · %s",
-					when.Format("01-02 15:04"), header(raw, "repo"), header(raw, "tool"), short(header(raw, "session")), command, result, path)})
+					when.Format("01-02 15:04"), rec.field("repo"), rec.field("tool"), short(rec.field("session")), command, result, rec.path)})
 			}
 		}
 	}
