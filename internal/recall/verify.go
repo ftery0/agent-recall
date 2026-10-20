@@ -264,9 +264,8 @@ func sessionCheck(session, cwd string, files []string, ended, now time.Time) str
 	return "  확인(git, 지금): " + strings.Join(notes, " · ")
 }
 
-// FactsText lists the ledger: standing facts that hold the words, with their state in git now,
-// or with review, the AI's proposals and the conflicts waiting on the person.
-func FactsText(query string, review, online bool, limit int) (string, error) {
+// FactsText lists the ledger: standing facts that hold the words, with their state in git now.
+func FactsText(query string, online bool, limit int) (string, error) {
 	lines, err := readFacts()
 	if err != nil {
 		return "", err
@@ -275,8 +274,7 @@ func FactsText(query string, review, online bool, limit int) (string, error) {
 	var out []string
 	shown, matched := 0, 0
 	for _, f := range foldFacts(lines) {
-		waiting := f.Status == factProposed || f.Status == factConflict
-		if review != waiting || (!review && f.Status != factActive) || !allWords(factKind(f.Slot)+" "+f.Slot+" "+f.Value, words) {
+		if f.Status != factActive || !allWords(factKind(f.Slot)+" "+f.Slot+" "+f.Value, words) {
 			continue
 		}
 		matched++
@@ -288,21 +286,15 @@ func FactsText(query string, review, online bool, limit int) (string, error) {
 		if len(f.Claims) > 0 && fullSessionID.MatchString(f.Claims[0].Evidence.Session) {
 			line += " · 세션 " + short(f.Claims[0].Evidence.Session)
 		}
-		if check := verifyFact(f, online); check != "" && !review {
+		if check := verifyFact(f, online); check != "" {
 			line += "\n    지금: " + check
 		}
 		out = append(out, line)
 	}
 	if matched == 0 {
-		if review {
-			return "확인을 기다리는 사실이 없다", nil
-		}
-		return "장부에 맞는 확정 사실이 없다 — 후보는 harness recall facts --review", nil
+		return "장부에 맞는 확정 사실이 없다", nil
 	}
 	head := fmt.Sprintf("확정 사실 %d개 — 장부는 본 것, '지금' 줄은 지금 git 이 말하는 것", matched)
-	if review {
-		head = fmt.Sprintf("확인을 기다리는 사실 %d개 — 채팅에 '확인 f…' 또는 '거절 f…' 를 직접 치면 다음 정리 때 반영된다", matched)
-	}
 	if matched > shown {
 		out = append(out, fmt.Sprintf("… 외 %d개 — --limit 로 늘리거나 말을 붙여 좁힌다", matched-shown))
 	}
@@ -328,6 +320,8 @@ func factKind(slot string) string {
 	case "relation":
 		from, to, _ := strings.Cut(rest, "/")
 		return "레포 관계 " + from + " → " + to
+	case "fix":
+		return "고친 명령"
 	case "choice":
 		return "선택"
 	case "rule":
@@ -335,19 +329,6 @@ func factKind(slot string) string {
 		return "규칙 " + repo
 	}
 	return kind
-}
-
-// prMadeIn names the conversation that opened pull request n of the repository at root, from the
-// gh output the ledger kept.
-func prMadeIn(root, n string) string {
-	own := worklog.OriginName(root)
-	lines, _ := readFacts()
-	for _, f := range foldFacts(lines) {
-		if parts := strings.Split(f.Slot, "/"); len(parts) == 4 && parts[0] == "pr" && parts[3] == n && len(f.Claims) > 0 && ownPR(root, own, f) {
-			return fmt.Sprintf("만든 대화: %s 세션 %s (gh 출력)", f.At.Local().Format("01-02 15:04"), short(f.Claims[0].Evidence.Session))
-		}
-	}
-	return ""
 }
 
 func allWords(text string, words []string) bool {
@@ -358,52 +339,4 @@ func allWords(text string, words []string) bool {
 		}
 	}
 	return true
-}
-
-// foreignPRHint is a pull request said to be another repository's: checked in that repository
-// when the ledger knows which one, never against this one's numbers. When the number is in several
-// repositories, the one named before it wins, then a backend one for a backend word, then one
-// cloned beside this repository, then the latest.
-func foreignPRHint(cwd, n, word string) string {
-	root := worklog.RepoRoot(cwd)
-	own := worklog.OriginName(root)
-	lines, _ := readFacts()
-	var pick factState
-	best := -1
-	for _, f := range foldFacts(lines) {
-		parts := strings.Split(f.Slot, "/")
-		if len(parts) != 4 || parts[0] != "pr" || parts[3] != n || len(f.Claims) == 0 || ownPR(root, own, f) {
-			continue
-		}
-		dir := repoFolder(cwd, parts[2])
-		cloned := worklog.OriginName(dir) == parts[2]
-		rank := 0
-		switch {
-		case strings.EqualFold(parts[2], word) || cloned && strings.EqualFold(filepath.Base(dir), word):
-			rank = 3
-		case worklog.Backend(word) && worklog.Backend(parts[2]):
-			rank = 2
-		case cloned:
-			rank = 1
-		}
-		if rank > best || rank == best && f.At.After(pick.At) {
-			pick, best = f, rank
-		}
-	}
-	if best >= 0 {
-		repo := strings.Split(pick.Slot, "/")[2]
-		return fmt.Sprintf("[다른 레포 PR %s#%s] %s\n", repo, n, verifyFact(pick, false)) + findHint("PR #"+n+" 이야기", "#"+n, 2)
-	}
-	return fmt.Sprintf("[PR #%s] 다른 레포 PR 로 보여 이 레포 git 으로 확인하지 않음\n", n) + findHint("PR #"+n+" 이야기", "#"+n, 2)
-}
-
-// ownPR says a pull request fact is the repository at root's: named by its origin or by its
-// folder, which keeps the new name when GitHub renamed the repository after it was cloned, or
-// opened from a clone or worktree with the same origin.
-func ownPR(root, own string, f factState) bool {
-	repo := strings.Split(f.Slot, "/")[2]
-	if root != "" && (strings.EqualFold(repo, own) || strings.EqualFold(repo, filepath.Base(root))) {
-		return true
-	}
-	return own != "" && worklog.OriginName(worklog.RepoRoot(f.Claims[0].Evidence.Cwd)) == own
 }

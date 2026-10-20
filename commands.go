@@ -3,31 +3,10 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"flag"
 	"github.com/ftery0/agent-recall/internal/adapters"
 	"github.com/ftery0/agent-recall/internal/install"
-	"github.com/ftery0/agent-recall/internal/recall"
 	"os"
-	"time"
 )
-
-func relearnCLI(args []string) (any, error) {
-	f := flag.NewFlagSet("relearn", flag.ContinueOnError)
-	dryRun := f.Bool("dry-run", false, "preview without saving")
-	token := f.String("expect-token", "", "source token returned by the preview")
-	if err := f.Parse(args); err != nil {
-		return nil, err
-	}
-	provided := false
-	f.Visit(func(v *flag.Flag) { provided = provided || v.Name == "expect-token" })
-	if len(f.Args()) != 0 || (*dryRun && provided) || (provided && *token == "") {
-		return nil, errors.New("use: recall relearn [--dry-run|--expect-token TOKEN]")
-	}
-	if *dryRun {
-		return recall.PreviewRelearn(time.Now())
-	}
-	return recall.RelearnChecked(time.Now(), *token)
-}
 
 func installCLI(args []string) (any, error) {
 	if len(args) < 2 {

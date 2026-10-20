@@ -1,8 +1,6 @@
 package recall
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +9,7 @@ import (
 func TestMissesCountLookupsThatCameBackEmptyOrFailedAndNoticeWeekly(t *testing.T) {
 	lookupSessions(t)
 	built := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, built); err != nil || out["written"] != 2 {
+	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), built); err != nil || out["written"] != 2 {
 		t.Fatal(out, err)
 	}
 	at := func(minute int) string {
@@ -47,16 +45,5 @@ func TestMissesCountLookupsThatCameBackEmptyOrFailedAndNoticeWeekly(t *testing.T
 	}
 	if text := MissesText(7, built.AddDate(0, 0, 30)); text != "지난 7일 기록에 AI가 부른 기억 명령이 없다" {
 		t.Fatal("지난 기록을 이번 주로 셈", text)
-	}
-	notice := "하네스: 지난 7일 AI 기억 명령 10번 중 빈 결과 4번·오류 3번 — 자세히는 harness recall misses"
-	if got := MissesNotice(built); got != notice {
-		t.Fatal("첫 알림이 다름", got)
-	}
-	if got := MissesNotice(built.Add(time.Hour)); got != "" {
-		t.Fatal("한 주 안에 다시 알림", got)
-	}
-	os.WriteFile(filepath.Join(Dir(), "misses-checked"), []byte(built.Add(-8*24*time.Hour).Format(time.RFC3339)+"\n"), 0o600)
-	if got := MissesNotice(built); got != notice {
-		t.Fatal("한 주가 지나도 다시 알리지 않음", got)
 	}
 }

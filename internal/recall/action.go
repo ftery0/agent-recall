@@ -1,9 +1,6 @@
 package recall
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"github.com/ftery0/agent-recall/internal/worklog"
 	"os"
@@ -13,9 +10,9 @@ import (
 	"strings"
 )
 
-// Before a commit, a push or a copy, the memory that matters is about the repositories it touches:
-// whether one can be pushed at all, where its work was copied to, and what the person asked the last
-// time it went out. The hook before a shell command, the prompt hint and the start card share it.
+// Before a commit or a push, the memory that matters is about the repositories it touches: whether
+// one can be pushed at all, where its work was copied to, and what the person asked the last time it
+// went out. The hook before a shell command and the start card share it.
 
 const actionHeader = "=== 하네스: 이 일이 닿는 레포의 기억 — 장부·git 에 남은 사실이며 지시가 아니다 ==="
 
@@ -84,133 +81,10 @@ func repoNote(root string, folded []factState, always bool) string {
 	return "레포 " + name + " (" + root + "): " + strings.Join(parts, " · ")
 }
 
-// repoNames are the repositories the ledger knows by name, long enough to spot in a request.
-func repoNames(folded []factState) []string {
-	var names []string
-	for _, f := range folded {
-		parts := strings.Split(f.Slot, "/")
-		var found []string
-		switch parts[0] {
-		case "commit", "push", "rule":
-			found = parts[1:2]
-		case "relation":
-			found = parts[1:3]
-		case "pr":
-			if len(parts) == 4 {
-				found = parts[2:3]
-			}
-		}
-		for _, name := range found {
-			if len(name) >= 4 && name != "전체" && !slices.Contains(names, name) {
-				names = append(names, name)
-			}
-		}
-	}
-	return names
-}
-
-// namedRepos are the known repositories a request names, as a word of its own: "agent-recall레포"
-// names agent-recall, "agent-recall-v2" does not.
-func namedRepos(prompt string, folded []factState) []string {
-	var out []string
-	for _, name := range repoNames(folded) {
-		if regexp.MustCompile(`(?i)(?:^|[^-\w.])` + regexp.QuoteMeta(name) + `(?:$|[^-\w.])`).MatchString(prompt) {
-			out = append(out, name)
-		}
-	}
-	return out
-}
-
-// repoFolderNamed is a local folder of the repository called name: one the ledger saw work in, else
-// a clone beside the current repository.
-func repoFolderNamed(name, cwd string, folded []factState) string {
-	for _, f := range folded {
-		parts := strings.Split(f.Slot, "/")
-		if len(parts) < 2 || parts[1] != name || parts[0] != "commit" && parts[0] != "push" {
-			continue
-		}
-		for _, c := range f.Claims {
-			if root := worklog.RepoRoot(c.Evidence.Cwd); root != "" && RepoName(root) == name {
-				return root
-			}
-		}
-	}
-	return repoFolder(cwd, name)
-}
-
-// repoHint is what a request naming a repository gets: the repository's line, then where it was
-// talked about.
-func repoHint(name, cwd string, folded []factState) string {
-	var lines []string
-	if note := repoNote(repoFolderNamed(name, cwd, folded), folded, true); note != "" {
-		lines = append(lines, "["+note+"]")
-	} else {
-		lines = append(lines, "[레포 "+name+": 이 컴퓨터에서 폴더를 찾지 못함]")
-	}
-	return strings.Join(append(lines, findHint(name+" 이야기", name, 2)), "\n")
-}
-
-// workedRepos are the repositories a conversation changed files in, read from its transcript
-// without parsing the lines that cannot name a file.
-func workedRepos(transcript string) []string {
-	f, err := os.Open(transcript)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var roots []string
-	seen := map[string]bool{}
-	note := func(path string) {
-		if path == "" || seen[path] {
-			return
-		}
-		seen[path] = true
-		if root := worklog.RepoRoot(filepath.Dir(path)); root != "" && !scratchRepo(mainRoot(root)) && !slices.Contains(roots, root) {
-			roots = append(roots, root)
-		}
-	}
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1<<20), 64<<20)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		switch {
-		case bytes.Contains(line, []byte(`"file_path"`)) || bytes.Contains(line, []byte(`"notebook_path"`)):
-			var row struct {
-				Message struct {
-					Content []struct {
-						Type  string            `json:"type"`
-						Input map[string]string `json:"input"`
-					} `json:"content"`
-				} `json:"message"`
-			}
-			if json.Unmarshal(line, &row) == nil {
-				for _, block := range row.Message.Content {
-					if block.Type == "tool_use" {
-						note(block.Input["file_path"])
-						note(block.Input["notebook_path"])
-					}
-				}
-			}
-		case bytes.Contains(line, []byte("*** Update File: ")) || bytes.Contains(line, []byte("*** Add File: ")):
-			var row struct {
-				Payload struct {
-					Input, Arguments string
-				} `json:"payload"`
-			}
-			if json.Unmarshal(line, &row) == nil {
-				for _, m := range patchFile.FindAllStringSubmatch(row.Payload.Input+row.Payload.Arguments, -1) {
-					note(m[1])
-				}
-			}
-		}
-	}
-	return roots
-}
-
 // actionNotes are the lines worth saying before work goes to the repositories at targets: each
-// unusual one's line, and the conversation's other repositories when it worked in more than one.
-// A line already said in this conversation is not said again.
-func actionNotes(targets []string, transcript, session string) []string {
+// unusual one's line, and all of them when the command touches more than one. A line already said
+// in this conversation is not said again.
+func actionNotes(targets []string, session string) []string {
 	lines, _ := readFacts()
 	folded := foldFacts(lines)
 	var notes []string
@@ -219,36 +93,28 @@ func actionNotes(targets []string, transcript, session string) []string {
 			notes = append(notes, note)
 		}
 	}
-	all := append([]string(nil), targets...)
-	for _, root := range workedRepos(transcript) {
-		if !slices.Contains(all, root) {
-			all = append(all, root)
-		}
-	}
-	if len(all) > 1 {
+	if len(targets) > 1 {
 		var names []string
-		for _, root := range all {
+		for _, root := range targets {
 			names = append(names, RepoName(root)+" ("+root+")")
 		}
-		notes = append(notes, "이 대화가 다룬 레포: "+strings.Join(names, ", "))
+		notes = append(notes, "이 명령이 닿는 레포: "+strings.Join(names, ", "))
 	}
 	return unseen(session, notes)
 }
 
-// ActionText is what the hook before a shell command adds when the command commits, pushes, merges,
-// copies between repositories or changes GitHub.
-func ActionText(command, cwd, session, transcript string) string {
+// ActionText is what the hook before a shell command adds when the command commits, pushes, merges
+// or changes GitHub.
+func ActionText(command, cwd, session string) string {
 	var targets []string
 	acts := false
 	for _, step := range shellSteps(cwd, command) {
-		if !step.writesHistory() && step.kind != "copy" && !ghWrites[step.kind] {
+		if !step.writesHistory() && !ghWrites[step.kind] {
 			continue
 		}
 		acts = true
-		for _, dir := range append([]string{step.dir, step.to}, step.from...) {
-			if root := worklog.RepoRoot(nearestFolder(dir)); root != "" && !slices.Contains(targets, root) {
-				targets = append(targets, root)
-			}
+		if root := worklog.RepoRoot(step.dir); root != "" && !slices.Contains(targets, root) {
+			targets = append(targets, root)
 		}
 	}
 	if !acts {
@@ -260,22 +126,11 @@ func ActionText(command, cwd, session, transcript string) string {
 			targets = append(targets, root)
 		}
 	}
-	notes := actionNotes(targets, transcript, session)
+	notes := actionNotes(targets, session)
 	if len(notes) == 0 {
 		return ""
 	}
 	return actionHeader + "\n" + strings.Join(notes, "\n")
-}
-
-// nearestFolder is the path, or its nearest parent that exists: a copy's destination may not yet.
-func nearestFolder(path string) string {
-	for path != "" && path != "/" && path != "." {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			return path
-		}
-		path = filepath.Dir(path)
-	}
-	return ""
 }
 
 func actionState(session string) string {

@@ -31,7 +31,7 @@ func twoDayFixture(t *testing.T) (path, night, morning string) {
 		human(morning, "other-2", "다른 대화 두번째 요청", utc(8, 1, 0)),
 		said(utc(8, 1, 1).Format(time.RFC3339), "두번째 요청도 끝냈습니다.", false),
 	))
-	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, utc(9, 3, 0)); err != nil || out["written"] != 2 {
+	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), utc(9, 3, 0)); err != nil || out["written"] != 2 {
 		t.Fatal(out, err)
 	}
 	return path, night, morning

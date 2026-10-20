@@ -73,10 +73,15 @@ func run(args []string) (any, error) {
 			}
 		}
 		output, err := adapters.StructureHook(args[1], payload)
-		// Codex has one hook before its tools; the memory of the repositories a command touches rides on
-		// it. The edit scope only ever answers with a decision, a reason or a system message.
+		// Codex has one hook before its tools and one after; the memory of the repositories a command
+		// touches rides on the first, a failed command's past fix on the second. The edit scope only
+		// ever answers with a decision, a reason or a system message.
 		if args[1] == "codex" && len(args) == 2 {
-			if action, ok := actionHook(payload).(memory.Object); ok {
+			added := actionHook(payload)
+			if memory.Text(payload["hook_event_name"]) == "PostToolUse" && memory.Text(payload["tool_name"]) == "Bash" && codexFailed(payload["tool_response"]) {
+				added = failureHook(payload)
+			}
+			if action, ok := added.(memory.Object); ok {
 				if output == nil {
 					output = memory.Object{}
 				}
@@ -113,8 +118,8 @@ func run(args []string) (any, error) {
 		return structureOutput{output, code, false}, nil
 	}
 	if args[0] == "worklog" {
-		if len(args) != 3 || (args[1] != "claude" && args[1] != "codex") || !slices.Contains([]string{"start", "prompt", "stop", "batch", "precompact", "action"}, args[2]) {
-			return nil, errors.New("use: worklog claude|codex start|prompt|stop|batch|precompact|action")
+		if len(args) != 3 || (args[1] != "claude" && args[1] != "codex") || !slices.Contains([]string{"start", "stop", "precompact", "action", "failure"}, args[2]) {
+			return nil, errors.New("use: worklog claude|codex start|stop|precompact|action|failure")
 		}
 		// A broken payload must never fail the client's hook, so it simply produces no card or block.
 		raw, err := adapters.ReadInput("-")
@@ -126,20 +131,15 @@ func run(args []string) (any, error) {
 			return nil, nil
 		}
 		switch args[2] {
-		case "batch":
-			if reminder := worklog.Batch(payload); reminder != nil {
-				return reminder, nil
-			}
-			return nil, nil
 		case "precompact":
 			// The summary may drop what the action hook said; it may say it again after.
 			recall.ForgetActions(memory.Text(payload["session_id"]))
 			// Printed text, exit 0: a PreCompact hook's exit 2 would block the compaction.
 			return worklog.CompactInstruction, nil
-		case "prompt":
-			return promptHook(payload, time.Now()), nil
 		case "action":
 			return actionHook(payload), nil
+		case "failure":
+			return failureHook(payload), nil
 		}
 		if args[2] == "start" {
 			// A sync copies what is missing, then records it.
@@ -199,10 +199,9 @@ func run(args []string) (any, error) {
 		}
 		if args[1] == "facts" {
 			f := flag.NewFlagSet("facts", flag.ContinueOnError)
-			review := f.Bool("review", false, "AI proposals and conflicts waiting on the person")
 			online := f.Bool("online", false, "also ask GitHub about pull requests")
 			backfill := f.Bool("backfill", false, "read every recorded conversation again for its facts")
-			rebuild := f.Bool("rebuild", false, "start the ledger again from every conversation, keeping the old one and the person's decisions")
+			rebuild := f.Bool("rebuild", false, "start the ledger again from every conversation, keeping the old one")
 			limit := f.Int("limit", 20, "fact count")
 			if err := f.Parse(flagsFirst(args[2:], "limit")); err != nil {
 				return nil, err
@@ -210,7 +209,7 @@ func run(args []string) (any, error) {
 			if *backfill || *rebuild {
 				return recall.BackfillFacts(time.Now(), *rebuild)
 			}
-			return recall.FactsText(strings.Join(f.Args(), " "), *review, *online, *limit)
+			return recall.FactsText(strings.Join(f.Args(), " "), *online, *limit)
 		}
 		if args[1] == "misses" {
 			m := flag.NewFlagSet("misses", flag.ContinueOnError)
@@ -220,21 +219,12 @@ func run(args []string) (any, error) {
 			}
 			return recall.MissesText(*days, time.Now()), nil
 		}
-		if len(args) == 2 && args[1] == "import-memory" {
-			return recall.ImportMemory(time.Now())
-		}
-		if args[1] == "relearn" {
-			return relearnCLI(args[2:])
-		}
 		if len(args) == 3 && args[1] == "eval" {
 			return recall.Eval(args[2])
 		}
 		if args[1] == "build" || args[1] == "sync" {
 			b := flag.NewFlagSet("build", flag.ContinueOnError)
 			since := b.String("since", time.Now().AddDate(0, 0, -14).Format("2006-01-02"), "first day")
-			// Records come from the transcript alone; the summary model runs only when asked by hand.
-			model := b.Bool("model", false, "also ask the summary model (manual)")
-			b.Bool("no-model", true, "the default; kept so older commands still run")
 			only := b.String("only", "", "record this one archived transcript")
 			if e := b.Parse(args[2:]); e != nil {
 				return nil, e
@@ -247,7 +237,7 @@ func run(args []string) (any, error) {
 				return nil, e
 			}
 			if args[1] == "sync" {
-				// A sweep already running means another sync is too; building twice would race on lessons.
+				// A sweep already running means another sync is too; building twice would race on the ledger.
 				swept, e := recall.Sweep()
 				if swept["skipped"] != nil {
 					return swept, e
@@ -255,7 +245,7 @@ func run(args []string) (any, error) {
 				if e != nil {
 					return swept, recall.SaveSyncStatus(swept, nil, e)
 				}
-				built, e := recall.Build(day, *model, time.Now())
+				built, e := recall.Build(day, time.Now())
 				if built["skipped"] != nil {
 					return built, e
 				}
@@ -264,51 +254,15 @@ func run(args []string) (any, error) {
 				}
 				return map[string]any{"archive": swept, "records": built}, e
 			}
-			return recall.Build(day, *model, time.Now())
+			return recall.Build(day, time.Now())
 		}
-		if args[1] == "lang" {
-			l := flag.NewFlagSet("lang", flag.ContinueOnError)
-			since := l.String("since", "2000-01-01", "first day")
-			sample := l.Int("sample", 0, "print this many judged blocks instead of the table")
-			if e := l.Parse(args[2:]); e != nil {
-				return nil, e
-			}
-			day, e := parseSince(*since)
-			if e != nil {
-				return nil, e
-			}
-			return recall.Lang(l.Args(), day, *sample)
-		}
-		return nil, errors.New("use: recall sweep|verify|find WORDS|day YYYY-MM-DD|MM-DD|오늘|어제 [WORDS]|source SESSION [WORDS]|misses [--days N]|eval FILE|import-memory|relearn [--dry-run|--expect-token TOKEN]|build [--since DAY] [--model]|sync|lang [--since DAY] [--sample N] [FILE...]")
+		return nil, errors.New("use: recall sweep|verify|find WORDS|day YYYY-MM-DD|MM-DD|오늘|어제 [WORDS]|source SESSION [WORDS]|misses [--days N]|eval FILE|build [--since DAY]|sync")
 	}
 	return nil, errors.New("unknown command")
 }
 
-func parseSince(value string) (time.Time, error) {
-	if at, err := time.Parse(time.RFC3339Nano, value); err == nil {
-		return at, nil
-	}
-	return time.ParseInLocation("2006-01-02", value, time.Local)
-}
-
-// promptHook adds what a request points to in the past, and once a week tells the person how
-// the agents' memory lookups went. Both clients read the same JSON; nothing found prints nothing.
-func promptHook(payload memory.Object, now time.Time) any {
-	out := memory.Object{}
-	if hint := recall.HintText(memory.Text(payload["prompt"]), memory.Text(payload["cwd"]), memory.Text(payload["session_id"]), memory.Text(payload["transcript_path"]), now); hint != "" {
-		out["hookSpecificOutput"] = memory.Object{"hookEventName": "UserPromptSubmit", "additionalContext": hint}
-	}
-	if notice := recall.MissesNotice(now); notice != "" {
-		out["systemMessage"] = notice
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// actionHook adds, before a shell command that commits, pushes, copies between repositories or
-// changes GitHub, what memory holds about the repositories it touches. Nothing unusual adds nothing.
+// actionHook adds, before a shell command that commits, pushes or changes GitHub, what memory holds
+// about the repositories it touches. Nothing unusual adds nothing.
 func actionHook(payload memory.Object) any {
 	// Codex runs the same hook after its tools too; by then the command has run.
 	if event := memory.Text(payload["hook_event_name"]); event != "" && event != "PreToolUse" {
@@ -319,11 +273,39 @@ func actionHook(payload memory.Object) any {
 	if command == "" {
 		return nil
 	}
-	text := recall.ActionText(command, memory.Text(payload["cwd"]), memory.Text(payload["session_id"]), memory.Text(payload["transcript_path"]))
+	text := recall.ActionText(command, memory.Text(payload["cwd"]), memory.Text(payload["session_id"]))
 	if text == "" {
 		return nil
 	}
 	return memory.Object{"hookSpecificOutput": memory.Object{"hookEventName": "PreToolUse", "additionalContext": text}}
+}
+
+// failureHook adds, after a shell command failed, how a failure like it was got past before. A
+// failure with nothing like it in memory adds nothing, and the hook never blocks.
+func failureHook(payload memory.Object) any {
+	if payload["is_interrupt"] == true {
+		return nil
+	}
+	input, _ := payload["tool_input"].(map[string]any)
+	command := memory.Text(input["command"]) + memory.Text(input["cmd"])
+	if command == "" {
+		return nil
+	}
+	text := recall.FailureText(command, memory.Text(payload["cwd"]), memory.Text(payload["session_id"]))
+	if text == "" {
+		return nil
+	}
+	event := memory.Text(payload["hook_event_name"])
+	if event == "" {
+		event = "PostToolUseFailure"
+	}
+	return memory.Object{"hookSpecificOutput": memory.Object{"hookEventName": event, "additionalContext": text}}
+}
+
+// codexFailed reads a Codex shell result. Codex hands the hook only the text the model saw, without
+// the exit code, so a failure is known by the error the program printed.
+func codexFailed(response any) bool {
+	return recall.OutputFailed(memory.Text(response))
 }
 
 // flagsFirst moves flags ahead of the words, so "source ID 말 --limit 2" reads like

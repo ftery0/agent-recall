@@ -55,9 +55,6 @@ var (
 	gitCommitted = regexp.MustCompile(`(?m)^\[([^\]\s]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\] (.+)$`)
 	hashSubject  = regexp.MustCompile(`(?m)^([0-9a-f]{7,40}) (.+)$`)
 	prLinkRe     = regexp.MustCompile(`https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)`)
-	// Typed by the person: "확인 f1a2b3c4" or "거절 f1a2b3c4 f5e6d7c8".
-	factVerdict = regexp.MustCompile(`^\s*(확인|거절)((?:[\s,]+f[0-9a-f]{7})+)\s*$`)
-	factShortID = regexp.MustCompile(`f[0-9a-f]{7}`)
 )
 
 // scratchRoots hold throwaway repositories: a commit made there, as a test fixture, is not work.
@@ -79,7 +76,7 @@ func digest(parts ...string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// shortFact is what the person types back: f and the fact's first seven hex digits.
+// shortFact names a fact in a listing: f and its first seven hex digits.
 func shortFact(fact string) string { return "f" + fact[:7] }
 
 func claim(slot, value, grade, scope string, ev factEvidence, at time.Time) factLine {
@@ -149,9 +146,9 @@ func appendFacts(have map[string]bool, lines []factLine, now time.Time) error {
 }
 
 // sessionFacts are what a conversation shows for certain: the commits and pushes git recorded for
-// it, the pull requests gh opened, the repositories it copied files between, the person's answers in
-// question windows, and the person's verdicts on facts.
-func sessionFacts(s session, known []factLine) []factLine {
+// it, the pull requests gh opened, the repositories it copied files between, the failures it got
+// past, and the person's answers in question windows.
+func sessionFacts(s session) []factLine {
 	repo := RepoName(s.cwd)
 	var out []factLine
 	for _, e := range s.events {
@@ -173,6 +170,7 @@ func sessionFacts(s session, known []factLine) []factLine {
 	for _, pair := range s.copies {
 		out = append(out, claim("relation/"+pair[0]+"/"+pair[1], "복사", "observed", pair[0], factEvidence{Session: s.id, Cwd: s.cwd}, s.end))
 	}
+	out = append(out, fixFacts(s, repo)...)
 	for _, c := range s.commands {
 		m := prLinkRe.FindStringSubmatch(c.output)
 		if m == nil || c.result == "실패" || !strings.Contains(unquoted(shellOnly(c.text)), "gh pr create") {
@@ -193,36 +191,9 @@ func sessionFacts(s session, known []factLine) []factLine {
 			question = strings.TrimPrefix(question, "질문: ")
 			ev.Quote = cut(mask(question), 200)
 			out = append(out, claim("choice/"+s.id+"/"+digest(question)[:12], cut(mask(answer), 300), "user", repo, ev, r.At))
-			continue
-		}
-		// Only words the person typed can confirm a fact; a queued or pasted line cannot.
-		m := factVerdict.FindStringSubmatch(r.Text)
-		if m == nil || (r.Source != "claude:typed" && r.Source != "claude:legacy" && r.Source != "claude:vscode" && r.Source != "codex:user") {
-			continue
-		}
-		for _, short := range factShortID.FindAllString(m[2], -1) {
-			fact := resolveShort(known, short)
-			if fact == "" {
-				continue
-			}
-			ev.Quote = cut(r.Text, 120)
-			out = append(out, factLine{Kind: "decision", ID: digest(fact, s.id, r.ID, m[1]), Fact: fact, Verdict: m[1], Evidence: ev, ObservedAt: r.At.UTC().Format(time.RFC3339)})
 		}
 	}
 	return out
-}
-
-func resolveShort(known []factLine, short string) string {
-	found := ""
-	for _, line := range known {
-		if line.Kind == "claim" && shortFact(line.Fact) == short {
-			if found != "" && found != line.Fact {
-				return "" // two facts share the prefix; the person must use a longer one
-			}
-			found = line.Fact
-		}
-	}
-	return found
 }
 
 func resolveDir(cwd, dir string) string {
@@ -260,33 +231,6 @@ func commitsMade(command, output string) []madeCommit {
 		}
 		if made.hash != "" || changed {
 			out = append(out, made)
-		}
-	}
-	return out
-}
-
-// lessonFacts carry the stored lessons over as the AI's proposals: a summary model wrote them,
-// so they stay candidates until the person confirms one.
-func lessonFacts() []factLine {
-	all, _ := loadLessons()
-	var out []factLine
-	for _, l := range all {
-		if l.Status == "보관" {
-			continue
-		}
-		at, err := time.ParseInLocation("2006-01-02", l.LastSeen, time.Local)
-		if err != nil {
-			at = time.Date(2026, 1, 1, 0, 0, 0, 0, time.Local)
-		}
-		ev := factEvidence{Quote: "lessons.json " + l.Origin}
-		if len(l.Sessions) > 0 && fullSessionID.MatchString(l.Sessions[0]) {
-			ev.Session = l.Sessions[0]
-		}
-		line := claim("rule/"+l.Scope+"/"+digest(l.Rule)[:12], l.Rule, "ai", l.Scope, ev, at)
-		out = append(out, line)
-		if l.Status == "활성" && l.Confirmed {
-			ev.Quote = "lessons.json 에 사용자 확인 표시"
-			out = append(out, factLine{Kind: "decision", ID: digest(line.Fact, "lessons.json", "확인"), Fact: line.Fact, Verdict: "확인", Evidence: ev, ObservedAt: line.ObservedAt})
 		}
 	}
 	return out
@@ -369,8 +313,7 @@ func foldFacts(lines []factLine) []factState {
 	return out
 }
 
-// factWriter adds facts during a build. Opening it carries the stored lessons over; each
-// session added can then decide on any fact already in the ledger.
+// factWriter adds facts during a build.
 type factWriter struct {
 	known []factLine
 	have  map[string]bool
@@ -386,7 +329,7 @@ func openFacts(now time.Time) (*factWriter, error) {
 	for _, line := range known {
 		w.have[line.ID] = true
 	}
-	return w, w.append(lessonFacts())
+	return w, nil
 }
 
 func (w *factWriter) append(lines []factLine) error {
@@ -403,49 +346,7 @@ func (w *factWriter) append(lines []factLine) error {
 	return nil
 }
 
-func (w *factWriter) add(s session) error { return w.append(sessionFacts(s, w.known)) }
-
-// confirmedRules are the rules the person confirmed for this repository, for the start card.
-func confirmedRules(repo string) []string {
-	lines, _ := readFacts()
-	var out []string
-	for _, f := range foldFacts(lines) {
-		if strings.HasPrefix(f.Slot, "rule/") && f.Status == factActive && (f.Scope == repo || f.Scope == "전체") {
-			out = append(out, f.Value)
-		}
-	}
-	return out
-}
-
-// FactsNotice is the start card's line about facts waiting on the person: answers of theirs that
-// disagree, and the AI's proposals from the last day. Older proposals wait for a review the person
-// starts, so a backlog does not fill every card.
-func FactsNotice(now time.Time) string {
-	lines, err := readFacts()
-	if err != nil {
-		return "사실 장부 읽기 실패: " + err.Error()
-	}
-	conflict, fresh := 0, 0
-	for _, f := range foldFacts(lines) {
-		switch {
-		case f.Status == factConflict:
-			conflict++
-		case f.Status == factProposed && now.Sub(f.At) < 24*time.Hour:
-			fresh++
-		}
-	}
-	var waiting []string
-	if conflict > 0 {
-		waiting = append(waiting, fmt.Sprintf("서로 다른 답 %d개", conflict))
-	}
-	if fresh > 0 {
-		waiting = append(waiting, fmt.Sprintf("새 AI 후보 %d개", fresh))
-	}
-	if len(waiting) == 0 {
-		return ""
-	}
-	return "사실 장부 확인 필요: " + strings.Join(waiting, " · ") + " — harness recall facts --review"
-}
+func (w *factWriter) add(s session) error { return w.append(sessionFacts(s)) }
 
 // BackfillFacts reads every recorded conversation again for its facts; a build only reads the
 // ones that changed. It is safe to repeat: a line already in the ledger is not written twice.

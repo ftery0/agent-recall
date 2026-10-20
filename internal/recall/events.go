@@ -484,6 +484,17 @@ func (g *gitCache) root(path string) string {
 	return root
 }
 
+// nearestFolder is the path, or its nearest parent that exists: a copy's destination may not yet.
+func nearestFolder(path string) string {
+	for path != "" && path != "/" && path != "." {
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			return path
+		}
+		path = filepath.Dir(path)
+	}
+	return ""
+}
+
 // reflog is every ref's history, newest first within each ref, from git's own record.
 func (g *gitCache) reflog(root string) *reflog {
 	if log, ok := g.reflogs[root]; ok {

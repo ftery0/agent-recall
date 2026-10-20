@@ -36,7 +36,7 @@ func storedSummaryCounts() (*int, *int) {
 		default:
 			return nil, nil
 		}
-		if state == "pending" || state == "failed" || rec.field("lessons_pending") == "true" {
+		if state == "pending" || state == "failed" {
 			pending++
 		}
 		if message, _ := summaryDiagnostics(rec.raw); message != "" {

@@ -328,13 +328,6 @@ func TestKoreanLines(t *testing.T) {
 	if card := Start("claude", memory.Object{"cwd": f.repo, "source": "resume"}); !strings.HasPrefix(card, compactLine+"\n") {
 		t.Fatalf("KL4 레포 카드면 맨 위: %s", card)
 	}
-	raw, _ := json.Marshal(Batch(memory.Object{"session_id": "s"}))
-	if !strings.Contains(string(raw), `"hookEventName":"PostToolBatch"`) || !strings.Contains(string(raw), `"additionalContext":"[언어] 진행 안내와 사용자에게 하는 설명은 한국어로 쓴다.`) {
-		t.Fatalf("KL5 묶음 안내 형식: %s", raw)
-	}
-	if out := Batch(memory.Object{"session_id": "s", "agent_id": "a1"}); out != nil {
-		t.Fatalf("KL6 하위 에이전트에는 없음: %v", out)
-	}
 	if !strings.Contains(CompactInstruction, "<summary> 안 첫 줄은 `"+SummaryMarker+"`") {
 		t.Fatalf("KL7 압축 지시 문장(전달 검증이 아님): %s", CompactInstruction)
 	}

@@ -55,7 +55,7 @@ func TestAQuietPushFromACopyIsRememberedBeforeTheNextPush(t *testing.T) {
 		bash("b2", `cd `+published+` && rtk git add -A && rtk git commit -qm "feat: 기억 개선" && rtk git push -q`, t0.Add(2*time.Minute)), bashResult("b2", "ok\nok\nok", t0.Add(2*time.Minute+5*time.Second)),
 	))
 	now := t0.Add(3 * time.Hour)
-	if _, err := Build(now.AddDate(0, 0, -1), false, now); err != nil {
+	if _, err := Build(now.AddDate(0, 0, -1), now); err != nil {
 		t.Fatal(err)
 	}
 	records, _ := loadRecords()
@@ -78,30 +78,24 @@ func TestAQuietPushFromACopyIsRememberedBeforeTheNextPush(t *testing.T) {
 		t.Fatal("장부에 커밋·push·관계가 틀리게 남음", commit, push, slots)
 	}
 	// Next conversation, in harness, about to push: where the work went, and what was asked then.
-	note := ActionText("git push", harness, "next-session", "")
+	note := ActionText("git push", harness, "next-session")
 	for _, want := range []string{"레포 harness", "원격 없음", "복사해 간 레포 agent-recall (대화 1개", "마지막 push: agent-recall origin/main ← " + hash[:8], "그때 사용자 원문: «agent-recall 레포에도 올려줘»"} {
 		if !strings.Contains(note, want) {
 			t.Fatalf("push 전에 %q 를 말하지 않음\n%s", want, note)
 		}
 	}
-	if again := ActionText("git commit -m x && git push", harness, "next-session", ""); again != "" {
+	if again := ActionText("git commit -m x && git push", harness, "next-session"); again != "" {
 		t.Fatal("같은 대화에 같은 말을 다시 함", again)
 	}
 	ForgetActions("next-session")
-	if again := ActionText("git push", harness, "next-session", ""); again == "" {
+	if again := ActionText("git push", harness, "next-session"); again == "" {
 		t.Fatal("압축 뒤에 다시 말하지 않음")
-	}
-	if hint := HintText("agent-recall레포에 올렸던 거 기억 안나?", harness, "other-session", "", now); !strings.Contains(hint, "[레포 agent-recall (") || !strings.Contains(hint, "복사해 온 레포 harness") {
-		t.Fatal("레포 이름을 말한 질문에 그 레포 기억을 붙이지 않음", hint)
 	}
 	// A repository with a remote and no relation says nothing before its push.
 	plain := filepath.Join(parent, "plain")
 	repoAt(t, plain, true, t0)
-	if note := ActionText("git commit -qm x && git push", plain, "third-session", ""); note != "" {
+	if note := ActionText("git commit -qm x && git push", plain, "third-session"); note != "" {
 		t.Fatal("특별할 것 없는 레포에 말을 붙임", note)
-	}
-	if hint := HintText("커밋하고 푸시해", plain, "third-session", "", now); hint != "" {
-		t.Fatal("특별할 것 없는 레포의 행동 요청에 말을 붙임", hint)
 	}
 }
 
@@ -169,7 +163,7 @@ func TestSubAgentsPullRequestLinksAndShellWritesAreRecorded(t *testing.T) {
 		t.Fatal("셸로 쓴 파일·서브에이전트 편집·PR 링크를 놓침", ok, s.files, s.prLinks)
 	}
 	now := t0.Add(time.Hour)
-	if _, err := Build(now.AddDate(0, 0, -1), false, now); err != nil {
+	if _, err := Build(now.AddDate(0, 0, -1), now); err != nil {
 		t.Fatal(err)
 	}
 	for _, query := range []string{"#377", "PR377", "pr #377"} {
@@ -207,7 +201,7 @@ func TestAWorktreeIsItsRepository(t *testing.T) {
 func TestRebuildKeepsDecisionsAndUnreadableConversations(t *testing.T) {
 	_, _, path := recordFixture(t)
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	if _, err := Build(now.AddDate(0, 0, -14), false, now); err != nil {
+	if _, err := Build(now.AddDate(0, 0, -14), now); err != nil {
 		t.Fatal(err)
 	}
 	decided := claim("choice/gone/q", "가", "user", "repo", factEvidence{Session: "gone-session"}, now)
@@ -271,7 +265,7 @@ func TestSourceOpensAFullIDsNewestFileOrTheConversationOfARequest(t *testing.T) 
 	}
 	write(t, path, jsonLines(t, first, said(t0.Add(time.Minute).Format(time.RFC3339), "처음 답", false), later, said(t0.Add(time.Hour+time.Minute).Format(time.RFC3339), "나중 답", false)))
 	now := t0.Add(2 * time.Hour)
-	if _, err := Build(now.AddDate(0, 0, -1), false, now); err != nil {
+	if _, err := Build(now.AddDate(0, 0, -1), now); err != nil {
 		t.Fatal(err)
 	}
 	out, err := SourcePage("req-later-0002", "", "", 0, 20)
@@ -353,13 +347,13 @@ func TestARecordOfWhatIsNoLongerAConversationIsRetired(t *testing.T) {
 	}
 	stale := record("1000-repo-55555555.md", "")
 	now := time.Date(2026, 10, 7, 3, 0, 0, 0, time.UTC)
-	out, err := Build(now.AddDate(0, 0, -1), false, now)
+	out, err := Build(now.AddDate(0, 0, -1), now)
 	if _, statErr := os.Stat(stale); err != nil || !os.IsNotExist(statErr) || len(out["retired"].([]string)) != 1 {
 		t.Fatal("대화가 아니게 된 원문의 옛 기록을 남김", out, err)
 	}
 	summarized := record("1000-repo-55555555.md", "summary_data: {\"title\": \"모델 요약\"}\n")
 	os.Remove(filepath.Join(Dir(), "not-sessions-10.json"))
-	out, err = Build(now.AddDate(0, 0, -1), false, now)
+	out, err = Build(now.AddDate(0, 0, -1), now)
 	if _, statErr := os.Stat(summarized); err != nil || statErr != nil || len(out["failed"].([]string)) != 0 {
 		t.Fatal("모델 요약이 든 기록까지 지움", out, err, statErr)
 	}
@@ -457,7 +451,7 @@ func TestACopyThroughAStagingFolderRelatesTheRepositoryItCarried(t *testing.T) {
 		bash("b3", "cp -R "+stage+"/. "+harness+"/ && cp "+filepath.Join(parent, "logo.png")+" "+web+"/", t0.Add(4*time.Minute)), bashResult("b3", "", t0.Add(4*time.Minute+time.Second)),
 	))
 	now := t0.Add(3 * time.Hour)
-	if _, err := Build(now.AddDate(0, 0, -1), false, now); err != nil {
+	if _, err := Build(now.AddDate(0, 0, -1), now); err != nil {
 		t.Fatal(err)
 	}
 	lines, _ := readFacts()
@@ -470,21 +464,7 @@ func TestACopyThroughAStagingFolderRelatesTheRepositoryItCarried(t *testing.T) {
 	if strings.Join(relations, ",") != "relation/harness/agent-recall" {
 		t.Fatal("거쳐 간 복사의 관계가 틀림", relations)
 	}
-	if note := ActionText("git push", harness, "next-session", ""); !strings.Contains(note, "복사해 간 레포 agent-recall") {
+	if note := ActionText("git push", harness, "next-session"); !strings.Contains(note, "복사해 간 레포 agent-recall") {
 		t.Fatal("push 전에 옮겨 간 레포를 말하지 않음", note)
-	}
-}
-
-func TestNamedReposNeedTheWholeName(t *testing.T) {
-	folded := []factState{{Slot: "push/agent-recall/origin/main"}, {Slot: "commit/harness/1a2b3c4d"}}
-	for prompt, want := range map[string]string{
-		"agent-recall레포에 올렸던 거 기억 안나?":  "agent-recall",
-		"Agent-Recall 에 올려":             "agent-recall",
-		"agent-recall-v2 만들자":           "",
-		"harness_old 정리하고 (harness) 커밋": "harness",
-	} {
-		if got := strings.Join(namedRepos(prompt, folded), ","); got != want {
-			t.Errorf("%q 에서 %q, 기대 %q", prompt, got, want)
-		}
 	}
 }

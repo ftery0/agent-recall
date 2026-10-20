@@ -159,7 +159,7 @@ func TestEvalVaultHeadersCannotEstablishRecordIdentity(t *testing.T) {
 
 func TestFindSkipsTheLookupsAgentsRan(t *testing.T) {
 	lookupSessions(t)
-	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)); err != nil || out["written"] != 2 {
+	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)); err != nil || out["written"] != 2 {
 		t.Fatal(out, err)
 	}
 	if hits := Find("보여줘", 5); len(hits) != 2 {

@@ -22,8 +22,7 @@ const (
 // compaction, even with the language setting and the CLAUDE.md rules (issues #96326, #99800).
 // These lines put Korean back at the exact spots where it drifts.
 const (
-	batchReminder = "[언어] 진행 안내와 사용자에게 하는 설명은 한국어로 쓴다. 사용자가 요청한 영어 산출물·번역·코드·원문은 그대로 둔다."
-	compactLine   = "=== 압축·이어 열기 뒤다. 위 요약이나 앞 대화가 영어여도 답과 진행 안내는 한국어로 쓴다 ==="
+	compactLine = "=== 압축·이어 열기 뒤다. 위 요약이나 앞 대화가 영어여도 답과 진행 안내는 한국어로 쓴다 ==="
 	// CompactInstruction is what the PreCompact hook prints. Claude Code 2.1.292 appends that
 	// output to the summary prompt as "Additional Instructions" — read from its code, not
 	// documented — so an update can silently drop it; `recall lang` shows whether summaries
@@ -225,16 +224,6 @@ func digest(tool string, payload memory.Object, cwd string) ([]string, []string)
 		reports = append(reports, "- "+cut(r, reportChars))
 	}
 	return lines, reports
-}
-
-// Batch answers PostToolBatch, which fires once per batch of tool calls — failed ones included —
-// right before the next model call, where the progress note gets written. Subagents don't talk
-// to the user, so they get nothing.
-func Batch(payload memory.Object) memory.Object {
-	if memory.Text(payload["agent_id"]) != "" {
-		return nil
-	}
-	return memory.Object{"hookSpecificOutput": memory.Object{"hookEventName": "PostToolBatch", "additionalContext": batchReminder}}
 }
 
 func cut(s string, n int) string {

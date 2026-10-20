@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/ftery0/agent-recall/internal/worklog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -233,4 +235,35 @@ func (r record) items(name string) []string {
 		out = append(out, item)
 	}
 	return out
+}
+
+var fullSessionID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// RepoName is the git top folder's name, else the folder's own name. A linked worktree is named
+// by its main folder: its own folder name is whatever the worktree was called.
+func RepoName(cwd string) string {
+	if root := worklog.RepoRoot(cwd); root != "" {
+		return filepath.Base(mainRoot(root))
+	}
+	return filepath.Base(cwd)
+}
+
+// mainRoot is the main folder of the repository a linked worktree belongs to, read from the
+// worktree's ".git" file; any other folder is its own.
+func mainRoot(root string) string {
+	if root == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(root, ".git"))
+	gitdir, ok := strings.CutPrefix(strings.TrimSpace(string(raw)), "gitdir: ")
+	if err != nil || !ok {
+		return root
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(root, gitdir)
+	}
+	if main, _, ok := strings.Cut(filepath.ToSlash(gitdir), "/.git/worktrees/"); ok {
+		return main
+	}
+	return root
 }

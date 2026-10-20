@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,7 +94,7 @@ func TestRecordKeepsAnswersEndingCompactionAndCommitSubject(t *testing.T) {
 	if _, ok := summaryOf([]byte(text)); ok {
 		t.Fatal("quoted compaction headings read back as a model summary", text)
 	}
-	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)); err != nil || out["written"] != 1 {
+	if out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)); err != nil || out["written"] != 1 {
 		t.Fatal(out, err)
 	}
 	if hits := Find("OAuth 만료", 5); len(hits) != 1 || !strings.Contains(hits[0].Line, "OAuth") {
@@ -107,8 +106,8 @@ func TestBuildWritesOnceAndRewritesWhenGrown(t *testing.T) {
 	_, vault, path := recordFixture(t)
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	since := time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)
-	out, err := Build(since, true, now)
-	if err != nil || out["written"] != 1 || out["summarized"] != 0 {
+	out, err := Build(since, now)
+	if err != nil || out["written"] != 1 {
 		t.Fatal(out, err)
 	}
 	records, _ := filepath.Glob(filepath.Join(RecordDir(), "2026-10-07", "*-abcdef12.md"))
@@ -118,20 +117,20 @@ func TestBuildWritesOnceAndRewritesWhenGrown(t *testing.T) {
 	if entries, _ := os.ReadDir(filepath.Join(vault, "personal", "10_프로젝트")); len(entries) != 0 {
 		t.Fatal("record written into the vault", entries)
 	}
-	if out, _ = Build(since, false, now); out["written"] != 0 {
+	if out, _ = Build(since, now); out["written"] != 0 {
 		t.Fatal("unchanged session rewritten", out)
 	}
 	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 	f.WriteString(`{"type":"user","promptSource":"typed","timestamp":"2026-10-07T02:00:00Z","message":{"role":"user","content":"하나 더"}}` + "\n")
 	f.Close()
-	if out, _ = Build(since, false, now); out["written"] != 1 {
+	if out, _ = Build(since, now); out["written"] != 1 {
 		t.Fatal("grown session not rewritten", out)
 	}
 	raw, _ := os.ReadFile(records[0])
 	if !strings.Contains(string(raw), "하나 더") {
 		t.Fatal(string(raw))
 	}
-	if out, _ = Build(since, false, now.Add(-time.Hour*10)); out["written"] != 0 {
+	if out, _ = Build(since, now.Add(-time.Hour*10)); out["written"] != 0 {
 		t.Fatal("unchanged active record rewritten", out)
 	}
 }
@@ -162,8 +161,8 @@ func TestBuildNoModelStoresRecentChoiceAndRepeatedConfirmation(t *testing.T) {
 		map[string]any{"type": "user", "uuid": "latest-choice", "version": "2.1.292", "timestamp": now.Add(-time.Minute).Format(time.RFC3339), "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "ask"}}}, "toolUseResult": map[string]any{"answers": map[string]any{question: "1번"}}},
 		recordHuman("latest-confirmation", "1번", now.Add(-time.Minute)),
 	)
-	out, err := Build(now.AddDate(0, 0, -14), false, now)
-	if err != nil || out["written"] != 1 || out["pending"] != 0 || out["summarized"] != 0 || len(out["failed"].([]string)) != 0 {
+	out, err := Build(now.AddDate(0, 0, -14), now)
+	if err != nil || out["written"] != 1 || out["pending"] != 0 || len(out["failed"].([]string)) != 0 {
 		t.Fatal(out, err)
 	}
 	raw, err := os.ReadFile(out["files"].([]string)[0])
@@ -180,7 +179,7 @@ func TestBuildNoModelStoresRecentChoiceAndRepeatedConfirmation(t *testing.T) {
 	}
 }
 
-func TestModelBuildUpdatesActiveFixedFieldsWithoutCallingModel(t *testing.T) {
+func TestBuildUpdatesFixedFieldsAndKeepsStoredSummary(t *testing.T) {
 	_, _, path := recordFixture(t)
 	s, _ := readSession("claude", path)
 	old := summary{Title: "기존 작업", Decisions: []decision{{What: "묶음 안내 미등록", Why: "효과 미확인"}}, Todo: []string{"실제 새 세션 검증"}}
@@ -188,21 +187,14 @@ func TestModelBuildUpdatesActiveFixedFieldsWithoutCallingModel(t *testing.T) {
 	write(t, dest, render(s, old, true))
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	appendRecordRows(t, path, recordHuman("recent", "최근 추가 결정도 보존해줘", now.Add(-time.Minute)))
-	calls := 0
-	out, err := build(now.AddDate(0, 0, -14), true, now, func(session, summary, int) (summary, int, error) {
-		calls++
-		return summary{}, 0, fmt.Errorf("an active session must not call the model")
-	})
-	if err != nil || calls != 0 || out["written"] != 1 || out["pending"] != 1 || len(out["failed"].([]string)) != 0 {
-		t.Fatal(out, err, calls)
+	out, err := Build(now.AddDate(0, 0, -14), now)
+	if err != nil || out["written"] != 1 || out["pending"] != 0 || len(out["failed"].([]string)) != 0 {
+		t.Fatal(out, err)
 	}
 	raw, _ := os.ReadFile(dest)
 	kept, ok := summaryOf(raw)
-	if !ok || kept.Title != old.Title || len(kept.Decisions) != 1 || kept.Decisions[0].Why != old.Decisions[0].Why || kept.Todo[0] != old.Todo[0] || !strings.Contains(string(raw), "최근 추가 결정도 보존해줘") || header(raw, "summary_cursor") != strconv.Itoa(len(fragments(s))) || header(raw, "summary_state") != "pending" {
-		t.Fatal("active fixed update lost prior state or cursor", string(raw))
-	}
-	if _, err := os.Stat(filepath.Join(Dir(), "model-calls-2026-10-08")); !os.IsNotExist(err) {
-		t.Fatal("active update consumed model budget", err)
+	if !ok || kept.Title != old.Title || len(kept.Decisions) != 1 || kept.Decisions[0].Why != old.Decisions[0].Why || kept.Todo[0] != old.Todo[0] || !strings.Contains(string(raw), "최근 추가 결정도 보존해줘") || header(raw, "summary_state") != "off" {
+		t.Fatal("fixed update lost the stored summary", string(raw))
 	}
 }
 
@@ -221,7 +213,7 @@ func TestBuildDiscoversRecentlyActiveSessionFromOldStartDate(t *testing.T) {
 	path := oldRecordSource(t)
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	appendRecordRows(t, path, recordHuman("recent", "오래된 세션에서 새 작업을 이어가자", now.Add(-time.Minute)))
-	out, err := Build(now.AddDate(0, 0, -14), false, now)
+	out, err := Build(now.AddDate(0, 0, -14), now)
 	if err != nil || out["written"] != 1 || out["pending"] != 0 {
 		t.Fatal(out, err)
 	}
@@ -246,27 +238,22 @@ func TestOldReadyRecordStaysUntouchedThenCapturesNewActivity(t *testing.T) {
 		}
 	}
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	calls := 0
-	call := func(s session, prior summary, cursor int) (summary, int, error) {
-		calls++
-		return prior, len(fragments(s)), nil
-	}
-	out, err := build(now.AddDate(0, 0, -14), true, now, call)
-	if err != nil || out["written"] != 0 || calls != 0 {
-		t.Fatal("unchanged ready record reprocessed", out, err, calls)
+	out, err := Build(now.AddDate(0, 0, -14), now)
+	if err != nil || out["written"] != 0 {
+		t.Fatal("unchanged ready record reprocessed", out, err)
 	}
 	unchanged, _ := os.ReadFile(dest)
 	if string(unchanged) != before {
 		t.Fatal("unchanged historical record rewritten", string(unchanged))
 	}
 	appendRecordRows(t, path, recordHuman("resumed", "한 달 전 작업의 새 요청", now.Add(-2*time.Hour)))
-	out, err = build(now.AddDate(0, 0, -14), true, now, call)
-	if err != nil || out["written"] != 1 || out["pending"] != 0 || calls != 1 {
-		t.Fatal("old ready record did not discover its new content", out, err, calls)
+	out, err = Build(now.AddDate(0, 0, -14), now)
+	if err != nil || out["written"] != 1 || out["pending"] != 0 {
+		t.Fatal("old ready record did not discover its new content", out, err)
 	}
 	after, _ := os.ReadFile(dest)
 	kept, ok := summaryOf(after)
-	if !ok || kept.Title != old.Title || kept.Todo[0] != old.Todo[0] || !strings.Contains(string(after), "한 달 전 작업의 새 요청") || header(after, "summary_state") != "ready" {
+	if !ok || kept.Title != old.Title || kept.Todo[0] != old.Todo[0] || !strings.Contains(string(after), "한 달 전 작업의 새 요청") || header(after, "summary_state") != "off" {
 		t.Fatal(string(after))
 	}
 }
@@ -283,7 +270,7 @@ func TestOldReadyRecordDetectsSameSizeRewriteWithoutNewTimestamp(t *testing.T) {
 	text, _ := os.ReadFile(path)
 	write(t, path, strings.ReplaceAll(string(text), "헤더", "푸터"))
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	out, err := Build(now.AddDate(0, 0, -14), false, now)
+	out, err := Build(now.AddDate(0, 0, -14), now)
 	if err != nil || out["written"] != 1 || out["pending"] != 0 {
 		t.Fatal("historical same-size source rewrite not discovered", out, err)
 	}
@@ -305,14 +292,14 @@ func TestBuildDiscoveryReadFailureStaysRetryable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(folder, 0o700) })
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	out, err := Build(now.AddDate(0, 0, -14), false, now)
+	out, err := Build(now.AddDate(0, 0, -14), now)
 	if err != nil || out["written"] != 0 || len(out["failed"].([]string)) != 1 {
 		t.Fatal("source discovery failure was silently excluded", out, err)
 	}
 	if err := os.Chmod(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	out, err = Build(now.AddDate(0, 0, -14), false, now)
+	out, err = Build(now.AddDate(0, 0, -14), now)
 	if err != nil || out["written"] != 1 || len(out["failed"].([]string)) != 0 {
 		t.Fatal("read failure permanently excluded source", out, err)
 	}
@@ -321,7 +308,7 @@ func TestBuildDiscoveryReadFailureStaysRetryable(t *testing.T) {
 func TestBuildSkipsWhenNothingTyped(t *testing.T) {
 	_, _, path := recordFixture(t)
 	write(t, path, `{"type":"user","timestamp":"2026-10-07T01:00:00Z","message":{"role":"user","content":"<command-name>x</command-name>"}}`+"\n")
-	out, _ := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
+	out, _ := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
 	if out["written"] != 0 {
 		t.Fatal(out)
 	}
@@ -333,7 +320,7 @@ func TestBuildSkipsWhenNothingTyped(t *testing.T) {
 
 func TestFindRanksRecordAndEvalCounts(t *testing.T) {
 	_, vault, _ := recordFixture(t)
-	Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
+	Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
 	write(t, filepath.Join(vault, "personal", "10_프로젝트", "_미분류", "작업 기록", "다른.md"), "# 다른 일\n결제 화면\n")
 	hits := Find("헤더를 숨김", 5)
 	// The only request is the title, so no line repeats it.
@@ -360,7 +347,7 @@ func TestFormatRebuildKeepsModelSummary(t *testing.T) {
 	old := strings.Replace(render(s, m, true), fmt.Sprintf("format: %d\n", recordFormat), "", 1)
 	dest := filepath.Join(RecordDir(), "2026-10-07", "1000-repo-abcdef12.md")
 	write(t, dest, old)
-	out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), false, time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
+	out, err := Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
 	if err != nil || out["written"] != 1 {
 		t.Fatal(out, err)
 	}
@@ -395,50 +382,6 @@ func toolResult(at string) map[string]any {
 	return map[string]any{"type": "user", "timestamp": at, "message": map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "t", "content": "ok"}}}}
 }
 
-func TestLangJudgesProgressFinalAndSummaries(t *testing.T) {
-	_, raw := fixture(t)
-	day := filepath.Join(raw, "claude", "2026-10-07")
-	summary := "This session is being continued from a previous conversation.\n\nSummary:\n요약 언어: 한국어\n## 1. 요청과 의도\n- 문서를 읽고 정리\n2. Key Technical Concepts:\n- PostToolBatch\n\nIf you need specific details from before compaction, read the full transcript."
-	write(t, filepath.Join(day, "11111111-0000-0000-0000-000000000000.jsonl"), jsonLines(t,
-		map[string]any{"type": "user", "promptSource": "typed", "sessionId": "11111111-0000-0000-0000-000000000000", "timestamp": "2026-10-07T01:00:00Z", "message": map[string]any{"role": "user", "content": "문서 읽고 정리해줘"}},
-		said("2026-10-07T01:00:01Z", "Reading the hooks reference first to check the batch event.", true),
-		toolResult("2026-10-07T01:00:02Z"),
-		said("2026-10-07T01:00:03Z", "`hooks.md` 를 읽었습니다. ~/docs/hooks.md 에서 PostToolBatch 절을 확인하고 다음 문서로 넘어갑니다.", true),
-		toolResult("2026-10-07T01:00:04Z"),
-		said("2026-10-07T01:00:05Z", "정리했습니다. 문서는 \"fires exactly once with the full batch, before the next model call\" 라고 적고 있습니다.", false),
-		map[string]any{"type": "system", "subtype": "compact_boundary", "timestamp": "2026-10-07T02:00:00Z"},
-		map[string]any{"type": "user", "isCompactSummary": true, "sessionId": "11111111-0000-0000-0000-000000000000", "version": "2.1.292", "timestamp": "2026-10-07T02:00:01Z", "message": map[string]any{"role": "user", "content": summary}},
-		said("2026-10-07T02:00:02Z", "Now checking the compaction section of the same reference.", true),
-		toolResult("2026-10-07T02:00:03Z"),
-		said("2026-10-07T02:00:04Z", "압축 절까지 확인했고 남은 일은 없습니다. 다음 단계는 시험입니다.", false),
-	))
-	write(t, filepath.Join(day, "22222222-0000-0000-0000-000000000000.jsonl"), jsonLines(t,
-		map[string]any{"type": "user", "promptSource": "sdk", "timestamp": "2026-10-07T01:00:00Z", "message": map[string]any{"role": "user", "content": "자동 시험 요청"}},
-		said("2026-10-07T01:00:01Z", "This automated session must never be counted in the table.", false),
-	))
-	since := time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)
-	out, err := Lang(nil, since, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"세션 1개", "| opus-5-5 | 2/3 66.7% | 0/2 0.0% | 1/2 50.0% | 1/1 100.0% |", "압축 요약 1개 — 설명이 한국어 1개 · 표식(요약 언어: 한국어) 1개 · 판정 불가 0개 · 절 제목 한국어 1/2", "11111111 2.1.292"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("missing %q\n%s", want, out)
-		}
-	}
-	if sample, _ := Lang(nil, since, 2); !strings.Contains(sample, "[영어] 진행 안내 · opus-5-5") || !strings.Contains(sample, "[한국어]") {
-		t.Fatalf("sample:\n%s", sample)
-	}
-	if out, _ := Lang(nil, time.Date(2026, 10, 8, 0, 0, 0, 0, time.Local), 0); !strings.Contains(out, "압축 요약 0개") || strings.Contains(out, "opus-5-5") {
-		t.Fatalf("since not applied:\n%s", out)
-	}
-	if out, _ := Lang([]string{filepath.Join(day, "22222222-0000-0000-0000-000000000000.jsonl")}, since, 0); !strings.Contains(out, "| opus-5-5 | - | 1/1 100.0% |") {
-		t.Fatalf("named test session not judged:\n%s", out)
-	}
-}
-
-// lookupSessions writes a Claude conversation and a Codex one whose agents ran memory lookups:
-// by name, through rtk, from a Codex app script, and one that failed.
 func lookupSessions(t *testing.T) (claude, codex string) {
 	t.Helper()
 	raw, _, claude := recordFixture(t)

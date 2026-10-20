@@ -108,18 +108,13 @@ func TestFoldFactsWeighsGradesDecisionsAndTime(t *testing.T) {
 	}
 }
 
-func TestSessionFactsTakeVerdictsOnlyFromTypedWords(t *testing.T) {
-	rule := claim("rule/repo/1", "검사 전에 묻는다", "ai", "repo", factEvidence{}, factAt(0))
-	short := shortFact(rule.Fact)
+func TestSessionFactsKeepQuestionWindowAnswers(t *testing.T) {
 	s := session{id: "s1", cwd: t.TempDir(), requests: []worklog.Request{
-		{ID: "a", Text: "확인 " + short, Source: "claude:typed", At: factAt(1)},
-		{ID: "b", Text: "거절 " + short, Source: "claude:queued", At: factAt(2)},
-		{ID: "c", Text: "확인 f0000000", Source: "claude:typed", At: factAt(3)},
-		{ID: "d", Text: "이거 확인 " + short + " 해줘", Source: "claude:typed", At: factAt(4)},
+		{ID: "a", Text: "확인 f0000000", Source: "claude:typed", At: factAt(1)},
 		{ID: "e", Text: "질문: 어디서 할까요?\n선택: 여기서", Source: "claude:choice", QuestionID: "ask", At: factAt(5)},
 	}}
 	var decisions, choices []factLine
-	for _, line := range sessionFacts(s, []factLine{rule}) {
+	for _, line := range sessionFacts(s) {
 		switch {
 		case line.Kind == "decision":
 			decisions = append(decisions, line)
@@ -127,8 +122,8 @@ func TestSessionFactsTakeVerdictsOnlyFromTypedWords(t *testing.T) {
 			choices = append(choices, line)
 		}
 	}
-	if len(decisions) != 1 || decisions[0].Verdict != "확인" || decisions[0].Evidence.Request != "a" {
-		t.Fatal("직접 친 확인만 결정이 되어야 함", decisions)
+	if len(decisions) != 0 {
+		t.Fatal("채팅 말을 사실 결정으로 읽음", decisions)
 	}
 	if len(choices) != 1 || choices[0].Value != "여기서" || choices[0].Grade != "user" || choices[0].Evidence.Quote != "어디서 할까요?" {
 		t.Fatal("선택창 답을 사용자 사실로 남기지 못함", choices)
@@ -157,11 +152,8 @@ func TestAppendFactsWritesOnceAndRefusesTimesWithoutZone(t *testing.T) {
 	}
 }
 
-func TestBuildRecordsCommitsPullRequestsAndConfirmedRules(t *testing.T) {
+func TestBuildRecordsCommitsAndPullRequests(t *testing.T) {
 	_, _, path := recordFixture(t)
-	if err := saveLessons([]Lesson{{Rule: "커밋 전에 검사 결과를 보인다", Scope: "repo", Origin: "기록", Status: "후보", LastSeen: "2026-10-06"}}); err != nil {
-		t.Fatal(err)
-	}
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	use := func(id, command string, at time.Time) map[string]any {
 		return map[string]any{"type": "assistant", "timestamp": at.Format(time.RFC3339), "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": id, "name": "Bash", "input": map[string]any{"command": command}}}}}
@@ -174,21 +166,17 @@ func TestBuildRecordsCommitsPullRequestsAndConfirmedRules(t *testing.T) {
 		use("c9", `git commit -m "fix: 헤더 정리"`, at), result("c9", "[main 9a8b7c6d] fix: 헤더 정리", at),
 		use("p9", "gh pr create --base dev --title 헤더", at), result("p9", "https://github.com/me/web/pull/12", at),
 	)
-	if _, err := Build(now.AddDate(0, 0, -14), false, now); err != nil {
+	if _, err := Build(now.AddDate(0, 0, -14), now); err != nil {
 		t.Fatal(err)
 	}
 	lines, err := readFacts()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rule factState
 	kinds := map[string]bool{}
 	commits := map[string]string{}
 	for _, f := range foldFacts(lines) {
 		kinds[strings.SplitN(f.Slot, "/", 2)[0]] = true
-		if strings.HasPrefix(f.Slot, "rule/") {
-			rule = f
-		}
 		if strings.HasPrefix(f.Slot, "commit/repo/") && f.Status == factActive {
 			commits[f.Value] = f.Ref
 		}
@@ -197,41 +185,7 @@ func TestBuildRecordsCommitsPullRequestsAndConfirmedRules(t *testing.T) {
 	if len(commits) != 2 || commits["fix: 헤더 정리"] != "9a8b7c6d" || commits["remove hide"] != "" {
 		t.Fatal("커밋 사실이 틀림", commits)
 	}
-	if !kinds["commit"] || !kinds["pr"] || rule.Status != factProposed {
-		t.Fatal("커밋·PR 이 없거나 교훈이 AI 후보로 오지 않음", kinds, rule)
-	}
-	if strings.Contains(strings.Join(CardLines("/work/repo"), "\n"), "커밋 전에 검사") {
-		t.Fatal("확인 전 후보가 카드에 나옴")
-	}
-	appendRecordRows(t, path, recordHuman("confirm", "확인 "+shortFact(rule.Fact), now.Add(-time.Hour)))
-	if _, err := Build(now.AddDate(0, 0, -14), false, now); err != nil {
-		t.Fatal(err)
-	}
-	if rules := confirmedRules("repo"); len(rules) != 1 || rules[0] != "커밋 전에 검사 결과를 보인다" {
-		t.Fatal("직접 친 확인이 규칙을 확정하지 못함", rules)
-	}
-}
-
-func TestFactsNoticeShowsConflictsAndOnlyTheDaysProposals(t *testing.T) {
-	fixture(t)
-	now := factAt(0).Add(72 * time.Hour)
-	if got := FactsNotice(now); got != "" {
-		t.Fatal("빈 장부에 알림", got)
-	}
-	old := claim("rule/repo/1", "오래된 후보", "ai", "repo", factEvidence{}, now.Add(-30*time.Hour))
-	if err := appendFacts(map[string]bool{}, []factLine{old}, now); err != nil {
-		t.Fatal(err)
-	}
-	if got := FactsNotice(now); got != "" {
-		t.Fatal("하루 지난 후보로 카드마다 알림", got)
-	}
-	fresh := claim("rule/repo/2", "새 후보", "ai", "repo", factEvidence{}, now.Add(-time.Hour))
-	tieA := claim("choice/s/t", "가", "user", "repo", factEvidence{Session: "s"}, factAt(3))
-	tieB := claim("choice/s/t", "나", "user", "repo", factEvidence{Session: "s", Request: "c"}, factAt(3))
-	if err := appendFacts(map[string]bool{}, []factLine{fresh, tieA, tieB}, now); err != nil {
-		t.Fatal(err)
-	}
-	if got := FactsNotice(now); got != "사실 장부 확인 필요: 서로 다른 답 2개 · 새 AI 후보 1개 — harness recall facts --review" {
-		t.Fatal(got)
+	if !kinds["commit"] || !kinds["pr"] || kinds["rule"] {
+		t.Fatal("커밋·PR 이 없거나 교훈이 장부에 옴", kinds)
 	}
 }

@@ -442,3 +442,32 @@ func beyondTitle(line, title string) string {
 	}
 	return strings.TrimSpace(line)
 }
+
+var (
+	// Words that only ask about the past or ask for an answer; what is left names the topic.
+	fillerWords = map[string]bool{"저번": true, "지난번": true, "지난": true, "전에": true, "하던": true, "하던거": true, "그거": true, "이거": true, "저거": true,
+		"어디": true, "어디까지": true, "뭐였지": true, "했는지": true, "했었지": true, "하다가": true, "말았던": true, "이어서": true, "계속": true,
+		"다시": true, "이유": true, "우리": true, "내가": true, "너가": true, "여기": true, "거기": true, "저기": true, "항상": true, "어제": true,
+		"그제": true, "그저께": true, "오늘": true, "있냐": true, "있니": true, "있던데": true, "했던데": true,
+		"보고": true, "정리": true, "확인": true, "하자": true, "해보자": true, "진행": true, "얘기": true, "애기": true, "무슨": true,
+		"어떻게": true, "됐어": true, "됐지": true, "했어": true, "할일": true, "해야": true, "해야되는거": true, "부분": true, "내용": true,
+		"뭐하다": true, "하다": true, "말았니": true, "말았지": true, "기억": true, "안나": true, "지금": true, "한번": true, "그냥": true,
+		"일단": true, "근데": true, "그리고": true, "전부": true, "전부다": true, "이제": true, "같은데": true, "보니까": true,
+		"아까": true, "마저": true, "마져": true, "했었는데": true, "제대로": true, "했잖아": true, "말했잖아": true, "그때": true, "저번에": true,
+		"기억해": true, "기억나": true, "못해": true, "못하고": true, "안돼": true, "있잖아": true, "알아서": true, "솔직히": true, "레포": true,
+		"다른": true, "까먹었어": true, "까먹었니": true, "했던거": true, "하던것": true, "했던": true}
+	fillerEnds = []string{"줘", "줘봐", "봐", "봐줘", "해봐", "할까", "했지", "했나", "는지", "던데", "있니", "있냐"}
+)
+
+// contentWord is a word that names something, not one that only asks about the past or for an answer.
+func contentWord(word string) bool {
+	if fillerWords[word] {
+		return false
+	}
+	for _, end := range fillerEnds {
+		if strings.HasSuffix(word, end) {
+			return false
+		}
+	}
+	return true
+}

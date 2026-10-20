@@ -12,25 +12,6 @@ import (
 	"time"
 )
 
-func TestRelearnRejectsAmbiguousOptionsWithoutWriting(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("HARNESS_HOME", root)
-	for _, args := range [][]string{
-		{"recall", "relearn", "--dry-run", "--expect-token", "token"},
-		{"recall", "relearn", "--expect-token", ""},
-		{"recall", "relearn", "unexpected"},
-		{"recall", "relearn", "--unknown"},
-	} {
-		if _, err := run(args); err == nil {
-			t.Fatalf("invalid options accepted: %v", args)
-		}
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 0 {
-		t.Fatal("invalid options changed the storage", entries, err)
-	}
-}
-
 func TestNativeStopKeepsEvidenceQuietAndStructureVisible(t *testing.T) {
 	for _, tool := range []string{"claude", "codex"} {
 		t.Run(tool, func(t *testing.T) {
@@ -132,7 +113,7 @@ func TestNativeStopKeepsEvidenceQuietAndStructureVisible(t *testing.T) {
 	}
 }
 
-func TestStartCardWorksOutsideGitAndDoesNotInjectGlobalLessonsIntoCasualCompact(t *testing.T) {
+func TestStartCardWorksOutsideGitAndDoesNotInjectOldWorkIntoCasualCompact(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("HARNESS_HOME", filepath.Join(root, "data"))
@@ -149,7 +130,7 @@ func TestStartCardWorksOutsideGitAndDoesNotInjectGlobalLessonsIntoCasualCompact(
 	if err := os.WriteFile(path, append(memory.Packed(row), '\n'), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := recall.Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), false, time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)); err != nil {
+	if _, err := recall.Build(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
 	card := startCard("claude", memory.Object{"cwd": cwd, "source": "startup"})
@@ -254,7 +235,7 @@ func TestStopThenStartImmediatelyKeepsChoiceWithoutBuildingRecords(t *testing.T)
 	}
 }
 
-func TestCompleteStartCardBudgetReservesSourcesLatestChoiceAndFailures(t *testing.T) {
+func TestCompleteStartCardKeepsSourcesLatestChoiceAndFailures(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("HARNESS_HOME", filepath.Join(root, "data"))
@@ -274,11 +255,7 @@ func TestCompleteStartCardBudgetReservesSourcesLatestChoiceAndFailures(t *testin
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	lessons := []recall.Lesson{{Rule: strings.Repeat("매우 긴 확인된 교훈 ", 700), Scope: "전체", Status: "활성", Confirmed: true}}
 	if err := os.MkdirAll(recall.Dir(), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(recall.Dir(), "lessons.json"), memory.Packed(lessons), 0600); err != nil {
 		t.Fatal(err)
 	}
 	status := memory.Object{"at": "2026-10-08T09:53:52+09:00", "failures": 1, "pending": 29, "unresolved": 29, "summary_attempts": 0}
@@ -293,19 +270,8 @@ func TestCompleteStartCardBudgetReservesSourcesLatestChoiceAndFailures(t *testin
 		t.Fatal(err)
 	}
 	card := startCard("claude", memory.Object{"cwd": root, "source": "compact"})
-	if len([]rune(card)) > 3000 || !strings.Contains(card, path) || !strings.Contains(card, "last-choice 줄13") || !strings.Contains(card, "PostToolBatch는 등록하지 않음") || !strings.Contains(card, "이번 수집 실패 1건") || strings.Contains(card, "미해결 요약 실패") || !strings.Contains(card, "생략된 내용") || !strings.Contains(card, "작업 구분: 개인") || !strings.Contains(card, "관련 과업") {
+	if len([]rune(card)) > 3000 || !strings.Contains(card, path) || !strings.Contains(card, "last-choice 줄13") || !strings.Contains(card, "PostToolBatch는 등록하지 않음") || !strings.Contains(card, "이번 수집 실패 1건") || strings.Contains(card, "미해결 요약 실패") || !strings.Contains(card, "작업 구분: 개인") || !strings.Contains(card, "관련 과업") {
 		t.Fatalf("combined budget lost priority content (%d): %s", len([]rune(card)), card)
-	}
-}
-
-func TestLanguageSinceAcceptsInstallationTimestamp(t *testing.T) {
-	for _, value := range []string{"2026-10-07", "2026-10-07T13:25:00+09:00"} {
-		if at, err := parseSince(value); err != nil || at.IsZero() {
-			t.Fatal(value, at, err)
-		}
-	}
-	if _, err := parseSince("yesterday"); err == nil {
-		t.Fatal("모호한시각허용")
 	}
 }
 
@@ -328,44 +294,55 @@ func runWithInput(t *testing.T, payload memory.Object, args ...string) any {
 	return out
 }
 
-func TestLanguageHooks(t *testing.T) {
+func TestPrecompactHookSpeaksOutsideTheHarnessOnly(t *testing.T) {
 	t.Setenv("HARNESS_RECALL", "")
-	if out, ok := runWithInput(t, memory.Object{"hook_event_name": "PostToolBatch", "session_id": "s"}, "worklog", "claude", "batch").(memory.Object); !ok || out["hookSpecificOutput"] == nil {
-		t.Fatalf("LH1 메인 대화 묶음에는 안내: %v", out)
-	}
-	if out := runWithInput(t, memory.Object{"hook_event_name": "PostToolBatch", "session_id": "s", "agent_id": "a1"}, "worklog", "claude", "batch"); out != nil {
-		t.Fatalf("LH2 하위 에이전트에는 없음: %v", out)
-	}
 	if out := runWithInput(t, memory.Object{"hook_event_name": "PreCompact", "trigger": "auto"}, "worklog", "claude", "precompact"); out != worklog.CompactInstruction {
-		t.Fatalf("LH3 압축 지시 출력: %v", out)
+		t.Fatalf("압축 지시 출력: %v", out)
 	}
 	t.Setenv("HARNESS_RECALL", "1")
-	for _, command := range []string{"batch", "precompact"} {
-		if out := runWithInput(t, memory.Object{"session_id": "s"}, "worklog", "claude", command); out != nil {
-			t.Fatalf("LH4 하네스 자체 호출에는 없음(%s): %v", command, out)
-		}
+	if out := runWithInput(t, memory.Object{"session_id": "s"}, "worklog", "claude", "precompact"); out != nil {
+		t.Fatalf("하네스 자체 호출에는 없음: %v", out)
 	}
 }
 
-func TestPromptHookAddsThePastARequestPointsToInJSONBothClientsRead(t *testing.T) {
+func TestFailureHookSaysAPastFixInJSONBothClientsRead(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("HARNESS_HOME", filepath.Join(root, "data"))
-	t.Setenv("HARNESS_VAULT_DIR", filepath.Join(root, "vault"))
 	t.Setenv("HARNESS_RECALL", "")
-	for _, tool := range []string{"claude", "codex"} {
-		if out := runWithInput(t, memory.Object{"hook_event_name": "UserPromptSubmit", "prompt": "이 파일 역할 알려줘", "cwd": root, "session_id": "s"}, "worklog", tool, "prompt"); out != nil {
-			t.Fatal("과거를 말하지 않은 질문에 무언가 붙임", tool, out)
-		}
-		out, ok := runWithInput(t, memory.Object{"hook_event_name": "UserPromptSubmit", "prompt": "어제 한 거 보고 오늘 할 일", "cwd": root, "session_id": "s"}, "worklog", tool, "prompt").(memory.Object)
-		specific, _ := out["hookSpecificOutput"].(memory.Object)
-		yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-		if !ok || len(out) != 1 || specific["hookEventName"] != "UserPromptSubmit" || !strings.Contains(memory.Text(specific["additionalContext"]), "["+yesterday+"] 그날 기록된 요청이 없다") {
-			t.Fatal("질문 훅 출력 모양이 다름", tool, out)
-		}
+	t.Setenv("TMPDIR", t.TempDir())
+	fix := `{"kind":"claim","id":"c1","fact":"f1","slot":"fix/addr/0123456789ab","value":"https://front.example.com:3000","grade":"observed","scope":"app","evidence":{"session":"old","quote":"http://front.example.com:3000"},"observed_at":"2026-10-19T01:00:00Z","recorded_at":"2026-10-19T01:00:00Z"}`
+	if err := os.MkdirAll(filepath.Join(root, "data", "recall"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "data", "recall", "misses-checked")); err != nil {
-		t.Fatal("주간 확인을 남기지 않음", err)
+	if err := os.WriteFile(filepath.Join(root, "data", "recall", "facts.jsonl"), []byte(fix+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	said := func(out any, event string) string {
+		object, _ := out.(memory.Object)
+		specific, _ := object["hookSpecificOutput"].(memory.Object)
+		if specific != nil && specific["hookEventName"] != event {
+			t.Fatal("다른 이벤트 이름으로 답함", specific)
+		}
+		return memory.Text(specific["additionalContext"])
+	}
+	command := map[string]any{"command": "webqa shot http://front.example.com:3000/ko/home"}
+	payload := memory.Object{"hook_event_name": "PostToolUseFailure", "tool_name": "Bash", "tool_input": command, "cwd": root, "session_id": "s1", "error": "Exit code 1", "is_interrupt": true}
+	if out := runWithInput(t, payload, "worklog", "claude", "failure"); out != nil {
+		t.Fatal("사용자가 멈춘 명령에 붙임", out)
+	}
+	payload["is_interrupt"] = false
+	if text := said(runWithInput(t, payload, "worklog", "claude", "failure"), "PostToolUseFailure"); !strings.Contains(text, "https://front.example.com:3000 로 됐다") {
+		t.Fatal("실패한 명령 뒤에 예전 고침을 붙이지 않음", text)
+	}
+	// Codex sends only the output text, with no exit code in it.
+	codex := memory.Object{"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": command, "cwd": root, "session_id": "s2", "tool_response": "saved shot.png"}
+	if text := said(runWithInput(t, codex, "edit-scope", "codex"), "PostToolUse"); text != "" {
+		t.Fatal("Codex 의 성공한 명령에 붙임", text)
+	}
+	codex["tool_response"] = "curl: (52) Empty reply from server"
+	if text := said(runWithInput(t, codex, "edit-scope", "codex"), "PostToolUse"); !strings.Contains(text, "https://front.example.com:3000 로 됐다") {
+		t.Fatal("Codex 의 실패한 명령 뒤에 붙이지 않음", text)
 	}
 }
 

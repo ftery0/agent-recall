@@ -197,46 +197,6 @@ func TestPRStateReadsTheLocalMerge(t *testing.T) {
 	}
 }
 
-func TestForeignPRHintPicksTheRepositoryTheWordNames(t *testing.T) {
-	recordFixture(t)
-	parent := t.TempDir()
-	// GitHub renamed web_old to web after it was cloned; web-copy is another clone of it.
-	web, copied := clone(t, parent, "web", "web_old", verifyAt), clone(t, parent, "web-copy", "web_old", verifyAt)
-	api := clone(t, parent, "api-be", "api-be", verifyAt)
-	merged := verifyAt.Add(time.Hour)
-	for _, dir := range []string{web, api} {
-		gitAt(t, dir, merged, "commit", "-q", "--allow-empty", "-m", "Merge pull request #7 from me/x")
-	}
-	pr := func(slot, cwd string, at time.Time) factLine {
-		return claim(slot, "만듦", "observed", strings.Split(slot, "/")[2], factEvidence{Session: "s-" + filepath.Base(cwd), Cwd: cwd}, at)
-	}
-	lines := []factLine{
-		pr("pr/me/api-be/7", api, verifyAt), pr("pr/me/design/7", "/gone/design", verifyAt.Add(time.Minute)),
-		pr("pr/me/web/7", web, verifyAt.Add(2*time.Minute)), pr("pr/me/web/8", web, verifyAt), pr("pr/me/storyboard/8", copied, verifyAt),
-	}
-	if err := appendFacts(map[string]bool{}, lines, verifyAt); err != nil {
-		t.Fatal(err)
-	}
-	inAPI := "[다른 레포 PR api-be#7] 내 컴퓨터 git 기록: " + merged.Local().Format("01-02 15:04") + " 머지됨 ("
-	for word, want := range map[string]string{
-		"백엔드": inAPI, "x": inAPI, // a backend word, or no word naming any: the clone beside this one
-		"design": "[다른 레포 PR design#7] 확인 불가(레포 폴더 없음)",
-	} {
-		if got := foreignPRHint(web, "7", word); !strings.HasPrefix(got, want) {
-			t.Errorf("%s: got %q, want %q…", word, got, want)
-		}
-	}
-	// #8 is this repository's own, under its new name and from another clone of it.
-	for _, n := range []string{"8", "9"} {
-		if got := foreignPRHint(web, n, "백엔드"); !strings.HasPrefix(got, "[PR #"+n+"] 다른 레포 PR 로 보여 이 레포 git 으로 확인하지 않음\n") {
-			t.Errorf("#%s: got %q", n, got)
-		}
-	}
-	if got := prMadeIn(web, "8"); !strings.HasPrefix(got, "만든 대화: ") {
-		t.Fatal("새 이름으로 남은 이 레포 PR 의 대화를 찾지 못함", got)
-	}
-}
-
 func TestCommitsInScratchRepositoriesAreNotWork(t *testing.T) {
 	fixture(t)
 	parent := t.TempDir()
@@ -263,7 +223,7 @@ func TestCommitsInScratchRepositoriesAreNotWork(t *testing.T) {
 	run := func(dir string) []factLine {
 		s := session{id: "s2", cwd: dir, commands: []command{{text: `git commit -qm "fix: 여기"`, source: "tool:t1", result: "성공", at: verifyAt, done: verifyAt}}}
 		newGitCache().readGit(&s)
-		return sessionFacts(s, nil)
+		return sessionFacts(s)
 	}
 	if got := run(fixtureRepo); len(got) != 0 {
 		t.Fatal("원격 없는 임시 폴더 커밋을 장부에 남김", got)

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/ftery0/agent-recall/internal/memory"
 	"github.com/ftery0/agent-recall/internal/worklog"
@@ -22,8 +21,6 @@ import (
 
 const (
 	idleBefore   = 30 * time.Minute // a session untouched this long is treated as finished
-	dailyModel   = 30               // manual model summaries per day
-	modelInput   = 12000            // characters of a session sent to the model
 	maxFiles     = 30
 	maxCommands  = 15
 	maxCompact   = 10000 // characters of the tool's own compaction summary kept in a record
@@ -46,7 +43,6 @@ var (
 	// begins; the same words inside a script or a quoted text are not a lookup.
 	recallCommand = regexp.MustCompile(`(?m)(?:^|&&|\|\||[;|]|\$\()\s*(?:rtk\s+(?:proxy\s+)?)?['"]?(?:[^\s'"]*/)?harness(?:-[\d.]+)?['"]?\s+recall\s+(?:find|day|source)\b`)
 	heredoc       = regexp.MustCompile(`<<-?\s*['"]?([A-Za-z_]\w*)['"]?`)
-	recorded      = regexp.MustCompile(`(?m)^raw_bytes: (\d+)$`)
 	// The subject line of `git commit -m "…"`, including the heredoc form and `git -C <dir> commit`.
 	// commitFile is a commit reading its message from a file, "-" being its own input.
 	commitFile    = regexp.MustCompile(`git(?:\s+-[cC]\s+(?:"[^"]+"|'[^']+'|\S+))*\s+commit\b[^\n]*?\s(?:-[a-zA-Z]*F\s*|--file[= ])(\S+)`)
@@ -95,7 +91,6 @@ type session struct {
 	size                        int64
 	requests                    []worklog.Request
 	hash                        string
-	lessonsPending              bool
 	cursor                      int
 	summaryState, summaryError  string
 	summaryAttempt              *summaryAttempt
@@ -103,6 +98,7 @@ type session struct {
 	files                       []string
 	omitted                     int       // changed files left out of files, the oldest
 	commands                    []command // checks, and git, gh and copy calls
+	tries                       []tried   // every shell command, for the failures it got past
 	prLinks                     []string  // pull requests the client linked to the conversation
 	recalls                     []command // memory lookups the agent ran and how each came back
 	compact                     string    // the tool's own summary at its latest compaction
@@ -151,15 +147,19 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 			s.files = append(s.files, file)
 		}
 	}
-	pending, asked := map[string]int{}, map[string]int{}
+	pending, asked, ran := map[string]int{}, map[string]int{}, map[string]int{}
+	edits := 0
 	run := func(id, text, dir string, at time.Time) {
 		_, seenCommand := pending[id]
 		_, seenLookup := asked[id]
-		if id != "" && (seenCommand || seenLookup) {
+		_, seenTry := ran[id]
+		if id != "" && (seenCommand || seenLookup || seenTry) {
 			return // a tool call written twice is one run
 		}
 		// Words inside a heredoc are text handed to another program, not a command run.
 		text = strings.TrimSpace(text)
+		ran[id] = len(s.tries)
+		s.tries = append(s.tries, tried{text: text, source: "tool:" + id, edits: edits, at: at})
 		shell := shellOnly(text)
 		if recallCommand.MatchString(shell) {
 			asked[id] = len(s.recalls)
@@ -186,6 +186,9 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 		}
 	}
 	finish := func(id string, failed bool, output string, at time.Time) {
+		if i, ok := ran[id]; ok {
+			s.tries[i].done, s.tries[i].failed = true, failed || failedOutput.MatchString(output)
+		}
 		if i, ok := pending[id]; ok {
 			c := &s.commands[i]
 			c.result, c.output, c.done = map[bool]string{false: "성공", true: "실패"}[failed], keepOutput(output), at
@@ -213,6 +216,7 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 					file, _ = input["notebook_path"].(string)
 				}
 				note(file)
+				edits++
 			case block["type"] == "tool_use" && block["name"] == "Bash":
 				text, _ := input["command"].(string)
 				run(id, text, "", at)
@@ -290,6 +294,7 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 			}
 			for _, m := range patchFile.FindAllStringSubmatch(args, -1) {
 				note(m[1])
+				edits++
 			}
 			var call struct {
 				Cmd       string   `json:"cmd"`
@@ -496,7 +501,7 @@ func render(s session, m summary, summarized bool) string {
 			cursor = len(fragments(s))
 		}
 	}
-	fmt.Fprintf(&b, "cwd: %q\nraw_sha256: %s\nsummary_state: %s\nsummary_cursor: %d\nsummary_prefix: %s\nsummary_error: %q\nlessons_pending: %t\n", s.cwd, s.hash, state, cursor, requestPrefix(s, cursor), s.summaryError, s.lessonsPending)
+	fmt.Fprintf(&b, "cwd: %q\nraw_sha256: %s\nsummary_state: %s\nsummary_cursor: %d\nsummary_prefix: %s\nsummary_error: %q\n", s.cwd, s.hash, state, cursor, requestPrefix(s, cursor), s.summaryError)
 	if s.summaryAttempt != nil {
 		fmt.Fprintf(&b, "last_summary_attempt: %s\n", mask(string(memory.Packed(s.summaryAttempt))))
 	}
@@ -979,26 +984,20 @@ func summaryDiagnostics(raw []byte) (string, *summaryAttempt) {
 	return mask(message), nil
 }
 
-// Build keeps every fixed field and last good summary, and retries pending work on later runs.
-func Build(since time.Time, useModel bool, now time.Time) (map[string]any, error) {
-	return build(since, useModel, now, summarizeNext)
-}
-
-type summaryCall func(session, summary, int) (summary, int, error)
-
-func build(since time.Time, useModel bool, now time.Time, call summaryCall) (map[string]any, error) {
-	return buildWithRecordWrite(since, useModel, now, call, memory.PrivateWrite, "")
+// Build records the conversations that changed, keeping each one's last model summary as it was.
+func Build(since time.Time, now time.Time) (map[string]any, error) {
+	return buildWithRecordWrite(since, now, memory.PrivateWrite, "")
 }
 
 // BuildConversation records one archived conversation now, as its Stop hook keeps it: the next start
 // card and the ledger need not wait for the next session's sweep.
 func BuildConversation(raw string, now time.Time) (map[string]any, error) {
-	return buildWithRecordWrite(time.Time{}, false, now, summarizeNext, memory.PrivateWrite, raw)
+	return buildWithRecordWrite(time.Time{}, now, memory.PrivateWrite, raw)
 }
 
 // The write seam exercises failures both before and after atomic replacement. only, when set, is
 // the one archived transcript to record.
-func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call summaryCall, writeRecord func(string, []byte) error, only string) (map[string]any, error) {
+func buildWithRecordWrite(since time.Time, now time.Time, writeRecord func(string, []byte) error, only string) (map[string]any, error) {
 	if os.Getenv("HARNESS_RECALL") == "1" {
 		return nil, nil
 	}
@@ -1024,9 +1023,9 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 	prior := map[string]priorRecord{}
 	for path, rec := range have {
 		size, _ := strconv.ParseInt(rec.field("raw_bytes"), 10, 64)
-		// Without the model only older pending summaries and unsaved lessons need another look.
+		// A summary an older build left pending is turned off by the next look.
 		state := rec.field("summary_state")
-		pending := rec.field("lessons_pending") == "true" || (state != "ready" && (useModel || state != "off"))
+		pending := state != "ready" && state != "off"
 		prior[path] = priorRecord{tool: rec.field("tool"), size: size, written: rec.mod, pending: pending}
 	}
 	var items []item
@@ -1108,23 +1107,10 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	used := 0
-	budgetPath := filepath.Join(Dir(), "model-calls-"+now.Format("2006-01-02"))
-	if useModel {
-		if raw, err := os.ReadFile(budgetPath); err == nil {
-			used, err = strconv.Atoi(strings.TrimSpace(string(raw)))
-			if err != nil || used < 0 {
-				return nil, fmt.Errorf("요약 사용량 파일 해석 실패")
-			}
-		} else if !os.IsNotExist(err) {
-			return nil, err
-		}
-	}
 	written, failed, retired := []string{}, discoveryFailed, []string{}
 	var git *gitCache // one for the whole build: conversations share repositories
 	var facts *factWriter
 	var factsErr error
-	summarized, attempts := 0, 0
 	storageUncertain := false
 	for _, it := range items {
 		info, err := os.Stat(it.path)
@@ -1132,7 +1118,6 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 			failed = append(failed, it.path+": "+err.Error())
 			continue
 		}
-		idle := now.Sub(it.at) >= idleBefore
 		hash, err := prefixHash(it.path, info.Size())
 		if err != nil {
 			failed = append(failed, it.path+": "+err.Error())
@@ -1155,10 +1140,7 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 		changed := prior.field("raw_sha256") != hash
 		stale := prior.field("format") != strconv.Itoa(recordFormat)
 		cursor, _ := strconv.Atoi(prior.field("summary_cursor"))
-		state := prior.field("summary_state")
-		retry := state != "ready" && useModel && idle && used < dailyModel
-		lessonsPending := prior.field("lessons_pending") == "true"
-		if !changed && !stale && !retry && !lessonsPending {
+		if state := prior.field("summary_state"); !changed && !stale && (state == "ready" || state == "off") {
 			continue
 		}
 		parsed, ok, err := readSessionChecked(it.tool, it.path)
@@ -1193,47 +1175,12 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 		if !changed && parsed.summaryError != "" {
 			parsed.summaryState = "failed"
 		}
-		if !useModel && parsed.summaryState != "ready" {
+		if parsed.summaryState != "ready" {
 			// The fixed fields are the record now. Nothing waits on a model, so its past failures
 			// are no longer pending work; a complete model summary stays as it was.
 			parsed.summaryState, parsed.summaryError, parsed.summaryAttempt = "off", "", nil
 		}
 		m := mergeSummary(parsed, old, summary{})
-		summarySucceeded := false
-		if parsed.summaryState != "ready" && useModel && idle && (parsed.end.IsZero() || now.Sub(parsed.end) >= idleBefore) && used < dailyModel {
-			if _, _, err = nextInput(parsed, old, cursor); err != nil {
-				failed = append(failed, it.path+": "+err.Error())
-				continue
-			}
-			if err = memory.PrivateWrite(budgetPath, []byte(strconv.Itoa(used+1))); err != nil {
-				return nil, err
-			}
-			used++
-			attempts++
-			parsed.summaryAttempt = &summaryAttempt{At: time.Now().Format(time.RFC3339), RawSHA: parsed.hash, Cursor: cursor, Outcome: "success"}
-			fresh, next, err := call(parsed, old, cursor)
-			if err != nil {
-				parsed.summaryState, parsed.summaryError = "failed", "요약 호출 실패; 기존 기억 유지"
-				parsed.summaryAttempt.Outcome = "unknown"
-				var failure *summaryFailure
-				if errors.As(err, &failure) {
-					parsed.summaryAttempt.Outcome, parsed.summaryAttempt.ExitCode = failure.Kind, failure.ExitCode
-					parsed.summaryError = failure.Error()
-				}
-				failed = append(failed, it.path+": "+parsed.summaryError)
-			} else if next < cursor || next > total || (next == cursor && cursor < total) {
-				parsed.summaryState, parsed.summaryError = "failed", "요약 처리 범위 오류; 이전 기억 유지"
-				parsed.summaryAttempt.Outcome = "range"
-				failed = append(failed, it.path+": "+parsed.summaryError)
-			} else {
-				m, hadSummary, parsed.cursor = fresh, true, next
-				parsed.summaryState, parsed.summaryError = "pending", ""
-				summarySucceeded = true
-				if next == total {
-					parsed.summaryState = "ready"
-				}
-			}
-		}
 		if git == nil {
 			git = newGitCache()
 		}
@@ -1253,16 +1200,6 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 			storageUncertain = true
 			failed = append(failed, dest+": 기억 저장 실패; 저장 결과 미확인")
 			continue
-		}
-		if summarySucceeded {
-			summarized++
-		}
-		if err = learn(parsed, m); err != nil {
-			parsed.lessonsPending = true
-			failed = append(failed, dest+": 교훈 갱신 실패: "+err.Error())
-			if err = writeRecord(dest, []byte(render(parsed, m, hadSummary))); err != nil {
-				return nil, err
-			}
 		}
 		if facts == nil && factsErr == nil {
 			facts, factsErr = openFacts(now)
@@ -1284,5 +1221,5 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 	if storedPending, storedUnresolved := storedSummaryCounts(); storedPending != nil {
 		pending, unresolved = *storedPending, *storedUnresolved
 	}
-	return map[string]any{"written": len(written), "summarized": summarized, "summary_attempts": attempts, "unresolved": unresolved, "pending": pending, "failed": failed, "files": written, "retired": retired, "storage_uncertain": storageUncertain}, nil
+	return map[string]any{"written": len(written), "unresolved": unresolved, "pending": pending, "failed": failed, "files": written, "retired": retired, "storage_uncertain": storageUncertain}, nil
 }

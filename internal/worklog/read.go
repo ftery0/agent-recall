@@ -55,7 +55,6 @@ type transcript struct {
 var (
 	nextItem  = regexp.MustCompile(`(?m)^## 다음[ \t]*\n(?:[ \t]*\n)*[ \t]*(?:[-*]|\d+\.)[ \t]*(.+)$`)
 	repoAside = regexp.MustCompile(`\(.*\)`)
-	spaces    = regexp.MustCompile(`\s+`)
 )
 
 func VaultDir() string {
@@ -802,11 +801,5 @@ func sessionCwd(path string) string {
 // or malformed input as an empty conversation. Reports are claims, not verified completion evidence.
 func ReadConversation(path string) ([]Request, []string, error) {
 	t, err := readTranscriptChecked(path)
-	return t.requests, t.reports, err
-}
-
-// ReadConversationReader parses an already captured snapshot without reopening a mutable path.
-func ReadConversationReader(reader io.Reader) ([]Request, []string, error) {
-	t, err := readTranscriptReader(reader)
 	return t.requests, t.reports, err
 }

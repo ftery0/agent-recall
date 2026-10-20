@@ -2,8 +2,6 @@ package recall
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -72,23 +70,4 @@ func MissesText(days int, now time.Time) string {
 		lines = append(lines, fmt.Sprintf("… 외 %d개", len(misses)-10))
 	}
 	return strings.Join(lines, "\n")
-}
-
-// MissesNotice tells the person, at most once a week, that memory lookups came back empty or
-// failed. The check itself also runs at most once a week.
-func MissesNotice(now time.Time) string {
-	path := filepath.Join(Dir(), "misses-checked")
-	if raw, err := os.ReadFile(path); err == nil {
-		if at, err := time.Parse(time.RFC3339, strings.TrimSpace(string(raw))); err == nil && now.Sub(at) < noticeEvery {
-			return ""
-		}
-	}
-	if os.MkdirAll(Dir(), 0o700) != nil || os.WriteFile(path, []byte(now.Format(time.RFC3339)+"\n"), 0o600) != nil {
-		return ""
-	}
-	total, counts, _ := recallTally(now.Add(-noticeEvery))
-	if counts["빈 결과"]+counts["오류"] == 0 {
-		return ""
-	}
-	return fmt.Sprintf("하네스: 지난 7일 AI 기억 명령 %d번 중 빈 결과 %d번·오류 %d번 — 자세히는 harness recall misses", total, counts["빈 결과"], counts["오류"])
 }

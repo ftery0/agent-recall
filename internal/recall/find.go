@@ -315,3 +315,6 @@ func flatText(v any) string {
 	}
 	return strings.Join(parts, "\n")
 }
+
+// FindLine tells the agent how to look further back than the start card.
+const FindLine = "=== 과거 작업은 `harness recall find <말>`, 그날 한 일은 `harness recall day <YYYY-MM-DD|어제>`, 원문은 `harness recall source <세션 ID> <말>` 로 본다 ==="
