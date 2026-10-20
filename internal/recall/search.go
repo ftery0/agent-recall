@@ -2,6 +2,7 @@ package recall
 
 import (
 	"math"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -45,8 +46,9 @@ type searchIndex struct {
 	avg   float64
 }
 
-// fold composes Hangul jamo and lowers case, so text and query compare the same way.
-func fold(s string) string { return strings.ToLower(compose(s)) }
+// fold composes Hangul jamo, lowers case and reads _ as -, so text and query compare the same way:
+// harness_recall and harness-recall are one name.
+func fold(s string) string { return strings.ReplaceAll(strings.ToLower(compose(s)), "_", "-") }
 
 // compose turns Hangul jamo (NFD, as macOS file names give them) into syllables.
 func compose(s string) string {
@@ -141,8 +143,8 @@ func newIndex(docs []Hit) *searchIndex {
 		u := searchUnit{doc: doc, show: show, ref: ref, heading: heading, tf: map[string]float64{}}
 		var text []string
 		for i, part := range parts {
+			text = append(text, fold(part))
 			part = compose(part) // keys need the case to split camelCase
-			text = append(text, strings.ToLower(part))
 			weight := 1.0
 			if i == 0 && len(parts) > 1 {
 				weight = humanWeight
@@ -218,9 +220,17 @@ func sections(title, body string) []section {
 // queryWords are the words a result must hold, as typed and without their particles. Filler that
 // only asks about the past does not have to be there, unless the query is nothing else.
 func queryWords(query string) (typed, forms []string) {
+	var words []string
+	for _, field := range strings.Fields(fold(query)) {
+		words = append(words, scriptWords(field)...)
+	}
 	for _, filler := range []bool{false, true} {
-		for _, word := range strings.Fields(fold(query)) {
+		for _, word := range words {
 			word = strings.Trim(word, "?!.,~\"'`()[]")
+			// PR377 and PR#377 are written "PR #377" in the records.
+			if m := prWord.FindStringSubmatch(word); m != nil {
+				word = "#" + m[1]
+			}
 			form := word
 			if stripped := terms(word); len(stripped) == 1 {
 				form = stripped[0]
@@ -235,6 +245,47 @@ func queryWords(query string) (typed, forms []string) {
 		}
 	}
 	return typed, forms
+}
+
+var prWord = regexp.MustCompile(`^pr-?#?(\d+)$`)
+
+// scriptWords splits a word where Hangul meets a Latin letter: "agent-recall레포" is a name and a
+// word typed without a space between them. Digits stay with either side, as in 10월 and PR377.
+func scriptWords(word string) []string {
+	letter := func(r rune) bool { return r < 0x80 && unicode.IsLetter(r) }
+	var out []string
+	runes := []rune(word)
+	start := 0
+	for i := 1; i < len(runes); i++ {
+		if hangul(runes[i-1]) && letter(runes[i]) || letter(runes[i-1]) && hangul(runes[i]) {
+			out = append(out, string(runes[start:i]))
+			start = i
+		}
+	}
+	return append(out, string(runes[start:]))
+}
+
+// rarest keeps the n words the fewest units hold, in their order; a word no unit holds is dropped.
+func (ix *searchIndex) rarest(words []string, n int) []string {
+	df := map[string]int{}
+	var known []string
+	for _, w := range words {
+		least := -1
+		keys(compose(w), func(k string) {
+			if d := ix.df[k]; least < 0 || d < least {
+				least = d
+			}
+		})
+		if least > 0 {
+			df[w], known = least, append(known, w)
+		}
+	}
+	if len(known) <= n {
+		return known
+	}
+	ranked := append([]string(nil), known...)
+	sort.SliceStable(ranked, func(i, j int) bool { return df[ranked[i]] < df[ranked[j]] })
+	return slices.DeleteFunc(known, func(w string) bool { return !slices.Contains(ranked[:n], w) })
 }
 
 // search ranks documents by score. A unit scores BM25 over the query keys times the share of

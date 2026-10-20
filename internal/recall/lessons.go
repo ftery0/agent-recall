@@ -99,12 +99,33 @@ func merge(all []Lesson, add Lesson, session, day string) []Lesson {
 	return append(all, add)
 }
 
-// RepoName is the git top folder's name, else the folder's own name.
+// RepoName is the git top folder's name, else the folder's own name. A linked worktree is named
+// by its main folder: its own folder name is whatever the worktree was called.
 func RepoName(cwd string) string {
 	if root := worklog.RepoRoot(cwd); root != "" {
-		return filepath.Base(root)
+		return filepath.Base(mainRoot(root))
 	}
 	return filepath.Base(cwd)
+}
+
+// mainRoot is the main folder of the repository a linked worktree belongs to, read from the
+// worktree's ".git" file; any other folder is its own.
+func mainRoot(root string) string {
+	if root == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(root, ".git"))
+	gitdir, ok := strings.CutPrefix(strings.TrimSpace(string(raw)), "gitdir: ")
+	if err != nil || !ok {
+		return root
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(root, gitdir)
+	}
+	if main, _, ok := strings.Cut(filepath.ToSlash(gitdir), "/.git/worktrees/"); ok {
+		return main
+	}
+	return root
 }
 
 // learn folds a summarized session's lesson candidates into lessons.json and re-renders 배운것.md.

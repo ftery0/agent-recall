@@ -37,7 +37,9 @@ type factEvidence struct {
 	Request string `json:"request,omitempty"` // request or tool call ID
 	Line    int    `json:"line,omitempty"`
 	Cwd     string `json:"cwd,omitempty"`
+	Origin  string `json:"origin,omitempty"` // the repository's remote, "" when it had none
 	Quote   string `json:"quote,omitempty"`
+	Asked   string `json:"asked,omitempty"` // the person's request the step followed
 }
 
 // Fact states, folded from the lines.
@@ -56,8 +58,6 @@ var (
 	// Typed by the person: "확인 f1a2b3c4" or "거절 f1a2b3c4 f5e6d7c8".
 	factVerdict = regexp.MustCompile(`^\s*(확인|거절)((?:[\s,]+f[0-9a-f]{7})+)\s*$`)
 	factShortID = regexp.MustCompile(`f[0-9a-f]{7}`)
-	gitDirFlag  = regexp.MustCompile(`git\s+-C\s+("[^"]+"|'[^']+'|\S+)\s+commit\b`)
-	changeDir   = regexp.MustCompile(`(?:^|&&|;|\n)\s*cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)`)
 )
 
 // scratchRoots hold throwaway repositories: a commit made there, as a test fixture, is not work.
@@ -121,7 +121,9 @@ func appendFacts(have map[string]bool, lines []factLine, now time.Time) error {
 		if _, err := time.Parse(time.RFC3339, line.ObservedAt); err != nil {
 			return fmt.Errorf("사실 시각에 시간대가 없다: %q", line.ObservedAt)
 		}
-		line.RecordedAt = now.UTC().Format(time.RFC3339)
+		if line.RecordedAt == "" { // a line carried over from an older ledger keeps its own
+			line.RecordedAt = now.UTC().Format(time.RFC3339)
+		}
 		raw, err := json.Marshal(line)
 		if err != nil {
 			return err
@@ -146,38 +148,43 @@ func appendFacts(have map[string]bool, lines []factLine, now time.Time) error {
 	return f.Close()
 }
 
-// sessionFacts are what a conversation shows for certain: commits and pull requests in the tools'
-// own output, the person's answers in question windows, and the person's verdicts on facts.
+// sessionFacts are what a conversation shows for certain: the commits and pushes git recorded for
+// it, the pull requests gh opened, the repositories it copied files between, the person's answers in
+// question windows, and the person's verdicts on facts.
 func sessionFacts(s session, known []factLine) []factLine {
 	repo := RepoName(s.cwd)
 	var out []factLine
-	for _, c := range s.commands {
-		if c.result == "실패" || !runsCommit(shellOnly(c.text)) {
-			continue
-		}
-		dir := commandDir(resolveDir(s.cwd, c.dir), shellOnly(c.text))
-		if scratchRepo(dir) {
-			continue
-		}
-		ev := factEvidence{Session: s.id, Request: strings.TrimPrefix(c.source, "tool:"), Cwd: dir}
-		where := repo
-		if dir != s.cwd {
-			where = RepoName(dir)
-		}
-		for _, commit := range commitsMade(c.text, c.output) {
-			key := commit.hash
+	for _, e := range s.events {
+		ev := factEvidence{Session: s.id, Request: strings.TrimPrefix(e.source, "tool:"), Cwd: e.root, Origin: e.origin, Asked: e.asked}
+		slot, value := "push/"+e.repo+"/"+e.ref, e.hash
+		if e.kind == "commit" {
+			key := e.hash
 			if key == "" {
-				key = digest(commit.subject)[:12]
+				key = digest(e.subject)[:12]
 			}
-			line := claim("commit/"+where+"/"+key, commit.subject, "observed", where, ev, c.at)
-			line.Ref = commit.hash
-			out = append(out, line)
+			slot, value = "commit/"+e.repo+"/"+key, e.subject
+		} else if value == "" {
+			value = "새 브랜치"
 		}
+		line := claim(slot, value, "observed", e.repo, ev, e.at)
+		line.Ref = e.hash
+		out = append(out, line)
 	}
-	for _, c := range s.published {
-		if m := prLinkRe.FindStringSubmatch(c.output); m != nil && c.result != "실패" {
-			ev := factEvidence{Session: s.id, Request: strings.TrimPrefix(c.source, "tool:"), Cwd: commandDir(resolveDir(s.cwd, c.dir), shellOnly(c.text)), Quote: m[0]}
-			out = append(out, claim("pr/"+m[1]+"/"+m[2]+"/"+m[3], "만듦", "observed", m[2], ev, c.at))
+	for _, pair := range s.copies {
+		out = append(out, claim("relation/"+pair[0]+"/"+pair[1], "복사", "observed", pair[0], factEvidence{Session: s.id, Cwd: s.cwd}, s.end))
+	}
+	for _, c := range s.commands {
+		m := prLinkRe.FindStringSubmatch(c.output)
+		if m == nil || c.result == "실패" || !strings.Contains(unquoted(shellOnly(c.text)), "gh pr create") {
+			continue
+		}
+		ev := factEvidence{Session: s.id, Request: strings.TrimPrefix(c.source, "tool:"), Cwd: resolveDir(s.cwd, c.dir), Quote: m[0], Asked: askedBefore(s.requests, c.at)}
+		out = append(out, claim("pr/"+m[1]+"/"+m[2]+"/"+m[3], "만듦", "observed", m[2], ev, c.at))
+	}
+	// The client links a pull request the conversation opened, however it was opened.
+	for _, url := range s.prLinks {
+		if m := prLinkRe.FindStringSubmatch(url); m != nil {
+			out = append(out, claim("pr/"+m[1]+"/"+m[2]+"/"+m[3], "만듦", "observed", m[2], factEvidence{Session: s.id, Cwd: s.cwd, Quote: m[0]}, s.end))
 		}
 	}
 	for _, r := range s.requests {
@@ -190,7 +197,7 @@ func sessionFacts(s session, known []factLine) []factLine {
 		}
 		// Only words the person typed can confirm a fact; a queued or pasted line cannot.
 		m := factVerdict.FindStringSubmatch(r.Text)
-		if m == nil || (r.Source != "claude:typed" && r.Source != "claude:legacy" && r.Source != "codex:user") {
+		if m == nil || (r.Source != "claude:typed" && r.Source != "claude:legacy" && r.Source != "claude:vscode" && r.Source != "codex:user") {
 			continue
 		}
 		for _, short := range factShortID.FindAllString(m[2], -1) {
@@ -218,19 +225,6 @@ func resolveShort(known []factLine, short string) string {
 	return found
 }
 
-// commandDir is the folder a commit ran in: "git -C <dir> commit", else where the "cd"s before
-// the commit lead, else the folder the call started in.
-func commandDir(cwd, shell string) string {
-	if m := gitDirFlag.FindStringSubmatch(shell); m != nil {
-		return resolveDir(cwd, strings.Trim(m[1], `"'`))
-	}
-	before, _, _ := strings.Cut(shell, "git commit")
-	for _, m := range changeDir.FindAllStringSubmatch(before, -1) {
-		cwd = resolveDir(cwd, strings.Trim(m[1], `"'`)) // each cd starts from the last one
-	}
-	return cwd
-}
-
 func resolveDir(cwd, dir string) string {
 	switch {
 	case dir == "":
@@ -247,15 +241,16 @@ func resolveDir(cwd, dir string) string {
 type madeCommit struct{ hash, subject string }
 
 // commitsMade reads what a commit command made. git prints "[branch hash] subject"; rtk prints only
-// "ok N files changed", and a hash line when the command also logged it.
+// "ok" or "ok N files changed", and a hash line when the command also logged it.
 func commitsMade(command, output string) []madeCommit {
 	var out []madeCommit
 	for _, m := range gitCommitted.FindAllStringSubmatch(output, -1) {
 		out = append(out, madeCommit{m[2], strings.TrimSpace(m[3])})
 	}
-	if len(out) > 0 || !strings.Contains(output, "files changed") && !strings.Contains(output, "file changed") {
+	if len(out) > 0 {
 		return out
 	}
+	changed := strings.Contains(output, "files changed") || strings.Contains(output, "file changed")
 	for _, subject := range commitSubjects(command) {
 		made := madeCommit{subject: subject}
 		for _, line := range hashSubject.FindAllStringSubmatch(output, -1) {
@@ -263,7 +258,9 @@ func commitsMade(command, output string) []madeCommit {
 				made.hash = line[1]
 			}
 		}
-		out = append(out, made)
+		if made.hash != "" || changed {
+			out = append(out, made)
+		}
 	}
 	return out
 }
@@ -452,14 +449,43 @@ func FactsNotice(now time.Time) string {
 
 // BackfillFacts reads every recorded conversation again for its facts; a build only reads the
 // ones that changed. It is safe to repeat: a line already in the ledger is not written twice.
-func BackfillFacts(now time.Time) (map[string]any, error) {
+// rebuild starts a new ledger when reading rules changed, the old one kept beside it: the person's
+// decisions and the claims they decided on carry over, and so do claims from conversations that
+// can no longer be read.
+func BackfillFacts(now time.Time, rebuild bool) (map[string]any, error) {
 	lock, err := exclusive(filepath.Join(Dir(), ".build.lock"))
 	if lock == nil {
 		return map[string]any{"skipped": "another build is running"}, err
 	}
 	defer lock.Close()
+	var old []factLine
+	backup := ""
+	if rebuild {
+		if old, err = readFacts(); err != nil {
+			return nil, err
+		}
+		backup = factsPath() + "." + now.Format("20060102-150405") + ".bak"
+		if err = os.Rename(factsPath(), backup); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
 	w, err := openFacts(now)
 	if err != nil {
+		return nil, err
+	}
+	decided := map[string]bool{}
+	for _, line := range old {
+		if line.Kind == "decision" {
+			decided[line.Fact] = true
+		}
+	}
+	var carried []factLine
+	for _, line := range old {
+		if decided[line.Fact] {
+			carried = append(carried, line)
+		}
+	}
+	if err = w.append(carried); err != nil {
 		return nil, err
 	}
 	before := len(w.known)
@@ -468,7 +494,8 @@ func BackfillFacts(now time.Time) (map[string]any, error) {
 	for _, e := range errs {
 		failed = append(failed, e.Error())
 	}
-	read := 0
+	git := newGitCache()
+	read := map[string]bool{}
 	for _, rec := range records {
 		raw := rec.field("raw")
 		if raw == "" {
@@ -482,10 +509,24 @@ func BackfillFacts(now time.Time) (map[string]any, error) {
 		if !ok {
 			continue
 		}
-		read++
+		read[s.id] = true
+		git.readGit(&s)
 		if err = w.add(s); err != nil {
 			return nil, err
 		}
 	}
-	return map[string]any{"sessions": read, "added": len(w.known) - before, "failed": failed}, nil
+	carried = nil
+	for _, line := range old {
+		if line.Kind == "claim" && !read[line.Evidence.Session] && !strings.HasPrefix(line.Slot, "rule/") {
+			carried = append(carried, line)
+		}
+	}
+	if err = w.append(carried); err != nil {
+		return nil, err
+	}
+	out := map[string]any{"sessions": len(read), "added": len(w.known) - before, "failed": failed}
+	if rebuild {
+		out["backup"], out["old_lines"], out["lines"] = backup, len(old), len(w.known)
+	}
+	return out, nil
 }

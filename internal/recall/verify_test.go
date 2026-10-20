@@ -43,11 +43,21 @@ func TestCommitStateSaysWhereACommitIsNow(t *testing.T) {
 	}
 	gitAt(t, web, verifyAt, "commit", "-q", "--allow-empty", "-m", "fix: 안 올림")
 	local := gitAt(t, web, verifyAt, "rev-parse", "--short=8", "HEAD")
-	found := gitAt(t, web, verifyAt, "rev-parse", "--short", "HEAD")
+	found := gitAt(t, web, verifyAt, "rev-parse", "--short=8", "HEAD")
 	gitAt(t, web, verifyAt, "commit", "-q", "--allow-empty", "-m", "fix: 취소함")
 	dropped := gitAt(t, web, verifyAt, "rev-parse", "--short=8", "HEAD")
 	gitAt(t, web, verifyAt, "reset", "-q", "--hard", "HEAD~1")
+	gitAt(t, web, verifyAt, "commit", "-q", "--allow-empty", "-m", "fix: 다시 씀")
+	before := gitAt(t, web, verifyAt, "rev-parse", "--short=8", "HEAD")
+	gitAt(t, web, verifyAt.Add(time.Minute), "commit", "-q", "--amend", "--allow-empty", "-m", "fix: 다시 씀")
+	after := gitAt(t, web, verifyAt, "rev-parse", "--short=8", "HEAD")
+	alone := filepath.Join(t.TempDir(), "alone")
+	gitAt(t, filepath.Dir(alone), verifyAt, "init", "-q", alone)
+	gitAt(t, alone, verifyAt, "commit", "-q", "--allow-empty", "-m", "first")
+	unpushed := gitAt(t, alone, verifyAt, "rev-parse", "--short=8", "HEAD")
 	for _, c := range []struct{ root, hash, subject, want string }{
+		{web, before, "fix: 다시 씀", "커밋 " + before + " 은 다시 쓰임 → 새 판 " + after + " 있음 · 원격 브랜치에 없음(안 올림)"},
+		{alone, unpushed, "first", "커밋 " + unpushed + " 있음 · 원격 없는 레포"},
 		{web, dropped, "", "커밋 " + dropped + " 어느 브랜치에도 없음(취소됐거나 다시 쓴 커밋)"},
 		{"", pushed, "", "확인 불가(레포 폴더 없음)"},
 		{web, pushed, "", "커밋 " + pushed + " 있음 · origin/main, origin/dev 외 1 에 올라감"},
@@ -74,8 +84,17 @@ func TestSessionCheckLooksInTheFolderTheCommitWasMadeIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The conversation ran in web and committed in api.
-	if got := sessionCheck("s1", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): 커밋 "+hash+" 있음 · 원격 브랜치에 없음(안 올림)" {
-		t.Fatal("커밋한 폴더 대신 대화 폴더에서 찾음", got)
+	if got := sessionCheck("s1", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): api 레포 커밋 "+hash+" 있음 · 원격 브랜치에 없음(안 올림)" {
+		t.Fatal("커밋한 폴더 대신 대화 폴더에서 찾았거나 다른 레포 이름이 없음", got)
+	}
+	// The folder it was made in is gone; a clone of the same remote beside this one answers.
+	moved := claim("commit/api/"+hash, "fix: 백엔드", "observed", "api", factEvidence{Session: "s6", Cwd: filepath.Join(parent, "api-wt"), Origin: "https://github.com/me/api.git"}, verifyAt)
+	moved.Ref = hash
+	if err := appendFacts(map[string]bool{}, []factLine{moved}, verifyAt); err != nil {
+		t.Fatal(err)
+	}
+	if got := sessionCheck("s6", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): api 레포 커밋 "+hash+" 있음 · 원격 브랜치에 없음(안 올림)" {
+		t.Fatal("사라진 폴더의 커밋을 같은 원격의 다른 clone 에서 찾지 못함", got)
 	}
 	// A worktree removed since keeps its commits in the conversation's repository; a subject alone
 	// is not taken from there.
@@ -92,10 +111,10 @@ func TestSessionCheckLooksInTheFolderTheCommitWasMadeIn(t *testing.T) {
 	if err := appendFacts(map[string]bool{}, []factLine{byHash, bySubject}, verifyAt); err != nil {
 		t.Fatal(err)
 	}
-	if got := sessionCheck("s2", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): 커밋 "+gone+" 있음 · 원격 브랜치에 없음(안 올림)" {
+	if got := sessionCheck("s2", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): wt 레포 커밋 "+gone+" 있음 · 원격 브랜치에 없음(안 올림)" {
 		t.Fatal("지운 worktree 의 커밋을 대화 레포에서 찾지 못함", got)
 	}
-	if got := sessionCheck("s3", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): fix: 지운 worktree → 확인 불가(레포 폴더 없음)" {
+	if got := sessionCheck("s3", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): wt 레포 fix: 지운 worktree → 확인 불가(레포 폴더 없음)" {
 		t.Fatal("제목만으로 다른 폴더의 커밋을 짚음", got)
 	}
 	gitAt(t, web, verifyAt, "commit", "-q", "--allow-empty", "-m", "Merge pull request #5 from me/x")
@@ -114,7 +133,7 @@ func TestSessionCheckLooksInTheFolderTheCommitWasMadeIn(t *testing.T) {
 	if err := appendFacts(map[string]bool{}, three, verifyAt); err != nil {
 		t.Fatal(err)
 	}
-	if got := sessionCheck("s5", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): fix: 셋째 → 이 컴퓨터 git 기록에 없음 · fix: 둘째 → 이 컴퓨터 git 기록에 없음" {
+	if got := sessionCheck("s5", web, nil, verifyAt, verifyAt); got != "  확인(git, 지금): api 레포 fix: 셋째 → 이 컴퓨터 git 기록에 없음 · api 레포 fix: 둘째 → 이 컴퓨터 git 기록에 없음" {
 		t.Fatal("대화가 멈춘 곳인 마지막 커밋 대신 처음 커밋을 보임", got)
 	}
 	if got := verifyFact(factState{Slot: "commit/api/x", Ref: hash, Claims: []factLine{{}}}, false); got != "확인 불가(레포 폴더 없음)" {
@@ -221,7 +240,10 @@ func TestForeignPRHintPicksTheRepositoryTheWordNames(t *testing.T) {
 func TestCommitsInScratchRepositoriesAreNotWork(t *testing.T) {
 	fixture(t)
 	parent := t.TempDir()
-	scratchRoots = []string{parent + "/"}
+	saved := scratchRoots
+	real, _ := filepath.EvalSymlinks(parent)
+	scratchRoots = []string{parent + "/", real + "/"}
+	t.Cleanup(func() { scratchRoots = saved })
 	web := clone(t, parent, "web", "web", verifyAt)
 	hash := gitAt(t, web, verifyAt, "rev-parse", "--short=8", "HEAD")
 	line := claim("commit/web/"+hash, "first", "observed", "web", factEvidence{Session: "s1", Cwd: web}, verifyAt)
@@ -232,8 +254,21 @@ func TestCommitsInScratchRepositoriesAreNotWork(t *testing.T) {
 	if got := sessionCheck("s1", web, nil, verifyAt, verifyAt); got != "" {
 		t.Fatal("임시 폴더 커밋을 확인 줄에 보임", got)
 	}
-	s := session{id: "s2", cwd: web, commands: []command{{text: "git commit -m init", source: "tool:t1", result: "성공", output: "[main (root-commit) " + hash + "] init", at: verifyAt}}}
-	if got := sessionFacts(s, nil); len(got) != 0 {
-		t.Fatal("임시 폴더 커밋을 장부에 남김", got)
+	// A test fixture with no remote is not work; a clone of a real remote there is.
+	fixtureRepo := filepath.Join(parent, "fixture")
+	gitAt(t, parent, verifyAt, "init", "-q", fixtureRepo)
+	for _, dir := range []string{fixtureRepo, web} {
+		gitAt(t, dir, verifyAt, "commit", "-q", "--allow-empty", "-m", "fix: 여기")
+	}
+	run := func(dir string) []factLine {
+		s := session{id: "s2", cwd: dir, commands: []command{{text: `git commit -qm "fix: 여기"`, source: "tool:t1", result: "성공", at: verifyAt, done: verifyAt}}}
+		newGitCache().readGit(&s)
+		return sessionFacts(s, nil)
+	}
+	if got := run(fixtureRepo); len(got) != 0 {
+		t.Fatal("원격 없는 임시 폴더 커밋을 장부에 남김", got)
+	}
+	if got := run(web); len(got) != 1 || got[0].Value != "fix: 여기" || got[0].Evidence.Origin != "https://github.com/me/web.git" {
+		t.Fatal("임시 폴더의 실제 원격 clone 커밋을 버림", got)
 	}
 }

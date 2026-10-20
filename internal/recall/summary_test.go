@@ -214,7 +214,7 @@ func TestSummaryWriteFailureBeforeAndAfterReplacementIsNotReportedAsSaved(t *tes
 						}
 					}
 					return errors.New("synthetic storage failure with private details")
-				})
+				}, "")
 			if err != nil || out["summarized"] != 0 || out["written"] != 0 || out["summary_attempts"] != 1 || out["storage_uncertain"] != true {
 				t.Fatal(out, err)
 			}

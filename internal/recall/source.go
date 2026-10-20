@@ -21,9 +21,16 @@ func SourcePage(prefix, query, requestID string, offset, limit int) (string, err
 	if !sourcePrefix.MatchString(prefix) || offset < 0 || limit < 1 || limit > 100 {
 		return "", fmt.Errorf("세션 ID·offset·limit 확인 필요")
 	}
-	matches, err := filepath.Glob(filepath.Join(RawDir(), "*", "*", "*"+prefix+"*.jsonl"))
+	matches, err := sourceFiles(prefix)
 	if err != nil {
 		return "", err
+	}
+	from := 0 // the line a request ID points to; the conversation is shown from there
+	if len(matches) == 0 {
+		// A start card names requests by their own IDs; the conversation holding one is its source.
+		if raw, line := requestSource(prefix); raw != "" {
+			matches, from = []string{raw}, line
+		}
 	}
 	if len(matches) != 1 {
 		return "", fmt.Errorf("원본 후보 %d개: 세션 ID를 더 길게 지정한다 (%s)", len(matches), prefix)
@@ -90,7 +97,7 @@ func SourcePage(prefix, query, requestID string, offset, limit int) (string, err
 	words := terms(query)
 	var chunks []string
 	for _, e := range entries {
-		if requestID != "" && e.id != requestID {
+		if requestID != "" && e.id != requestID || e.line < from {
 			continue
 		}
 		text := mask(e.text)
@@ -116,4 +123,40 @@ func SourcePage(prefix, query, requestID string, offset, limit int) (string, err
 		lines = append(lines, fmt.Sprintf("이어서: --offset %d --limit %d", end, limit))
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+// sourceFiles are the transcripts whose name holds prefix. A full ID names its own file, never one
+// that only contains it; a Codex conversation resumed in a second file is its newest one.
+func sourceFiles(prefix string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(RawDir(), "*", "*", "*"+prefix+"*.jsonl"))
+	if err != nil || len(matches) < 2 {
+		return matches, err
+	}
+	var exact []string
+	for _, path := range matches {
+		if name := filepath.Base(path); name == prefix+".jsonl" || strings.HasSuffix(name, "-"+prefix+".jsonl") {
+			exact = append(exact, path)
+		}
+	}
+	if len(exact) == 0 {
+		return matches, nil
+	}
+	sort.SliceStable(exact, func(i, j int) bool { return lastActive(exact[i]).After(lastActive(exact[j])) })
+	return exact[:1], nil
+}
+
+// requestSource is the transcript holding a request ID, from the records, and the request's line.
+func requestSource(id string) (string, int) {
+	records, _ := loadRecords()
+	for _, rec := range records {
+		if !strings.Contains(string(rec.raw), "["+id+" ") {
+			continue
+		}
+		for _, r := range rec.requests() {
+			if r.id == id {
+				return rec.field("raw"), r.line
+			}
+		}
+	}
+	return "", 0
 }

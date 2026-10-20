@@ -33,8 +33,11 @@ type Hit struct {
 var particles = []string{"에서는", "에서", "으로", "에게", "까지", "부터", "했지", "했던", "하던", "했어", "이랑", "은", "는", "이", "가", "을", "를", "에", "로", "와", "과", "도", "만", "의", "랑"}
 
 func terms(query string) []string {
-	var out []string
-	for _, word := range strings.Fields(strings.ToLower(query)) {
+	var out, words []string
+	for _, field := range strings.Fields(strings.ToLower(query)) {
+		words = append(words, scriptWords(field)...)
+	}
+	for _, word := range words {
 		for _, p := range particles {
 			if trimmed := strings.TrimSuffix(word, p); trimmed != word && len([]rune(trimmed)) >= 2 {
 				word = trimmed
@@ -310,5 +313,5 @@ func flatText(v any) string {
 			parts = append(parts, text)
 		}
 	}
-	return strings.Join(parts, " ")
+	return strings.Join(parts, "\n")
 }

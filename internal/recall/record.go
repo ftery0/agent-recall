@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ const (
 	maxCommands  = 15
 	maxCompact   = 10000 // characters of the tool's own compaction summary kept in a record
 	recordFolder = "기록"
-	recordFormat = 9             // raise when reading rules change; older records are rebuilt
+	recordFormat = 11            // raise when reading rules change; older records are rebuilt
 	requestStamp = "01-02 15:04" // request lines carry their day; a conversation can run for days
 	endStamp     = "2006-01-02 15:04"
 )
@@ -35,6 +36,10 @@ const (
 var (
 	patchFile = regexp.MustCompile(`\*\*\* (?:Update|Add|Delete) File: ([^\n\\"]+)`)
 	exitCode  = regexp.MustCompile(`(?:exited with code|Exit code:?)\s*(\d+)`)
+	// A Codex command still running when the call returned; write_stdin calls read the rest.
+	stillRunning = regexp.MustCompile(`Process running with session ID (\d+)`)
+	// Lines saying what git or gh made, kept past the cut of a long output.
+	madeLine  = regexp.MustCompile(`(?m)^(?:\[[^\]\n]+ [0-9a-f]{7,40}\] .*|To \S+|\s*[ +*]\s*(?:[0-9a-f]{7,40}\.\.\.?[0-9a-f]{7,40}|\[new [a-z]+\])\s+\S+\s+->\s+\S+.*|ok [0-9a-f]{7,40}\b.*|.*https://github\.com/[\w.-]+/[\w.-]+/pull/\d+.*)$`)
 	checkLike = regexp.MustCompile(`\b(test|lint|tsc|vet|build|eslint|pytest|jest|vitest|typecheck)\b`)
 	pipe      = regexp.MustCompile(`(^|[^|])\|([^|]|$)`)
 	// A memory lookup the agent ran, by name, through rtk, or by the installed path, where a command
@@ -43,8 +48,9 @@ var (
 	heredoc       = regexp.MustCompile(`<<-?\s*['"]?([A-Za-z_]\w*)['"]?`)
 	recorded      = regexp.MustCompile(`(?m)^raw_bytes: (\d+)$`)
 	// The subject line of `git commit -m "…"`, including the heredoc form and `git -C <dir> commit`.
+	// commitFile is a commit reading its message from a file, "-" being its own input.
+	commitFile    = regexp.MustCompile(`git(?:\s+-[cC]\s+(?:"[^"]+"|'[^']+'|\S+))*\s+commit\b[^\n]*?\s(?:-[a-zA-Z]*F\s*|--file[= ])(\S+)`)
 	commitMessage = regexp.MustCompile(`git(?:\s+-[cC]\s+(?:"[^"]+"|'[^']+'|\S+))*\s+commit\b[^\n]*?\s-[a-zA-Z]*m\s+(?:"\$\(cat <<-?'?EOF'?\s*\n)?["']?([^"'\n]+)`)
-	gitCommit     = regexp.MustCompile(`\bgit(?:\s+-[cC](?:\s+\S+)?)*\s+commit\b`)
 	tagged        = regexp.MustCompile(`(?s)<[a-z_][a-z0-9_-]*[^>]*>(.*?)</[a-z_][a-z0-9_-]*[^>]*>`)
 	imageRef      = regexp.MustCompile(`\[Image #\d+\]`)
 	// Tags a nested block leaves behind once the outer pair is removed.
@@ -75,9 +81,12 @@ type command struct {
 	source string
 	result string // 성공, 실패, 끝 명령 성공 (a pipeline), or empty when the transcript does not say
 	piped  bool   // a pipeline's exit is its last command's; a check before a pipe may have failed
-	output string // kept for commits and pull requests, whose output names what was made
+	output string // what git and gh printed names what they made
 	dir    string // the folder the tool call named, when it named one
+	check  bool   // runs a test, a linter, a type check or a build
+	github bool   // changes GitHub: a pull request or a repository
 	at     time.Time
+	done   time.Time // when its result came; git's reflog is read between the two
 }
 
 type session struct {
@@ -92,10 +101,13 @@ type session struct {
 	summaryAttempt              *summaryAttempt
 	reports                     []string
 	files                       []string
-	commands                    []command
-	published                   []command // gh pr create runs: their output holds the PR link
+	omitted                     int       // changed files left out of files, the oldest
+	commands                    []command // checks, and git, gh and copy calls
+	prLinks                     []string  // pull requests the client linked to the conversation
 	recalls                     []command // memory lookups the agent ran and how each came back
 	compact                     string    // the tool's own summary at its latest compaction
+	events                      []gitEvent
+	copies                      [][2]string // repository names files were copied from and to
 }
 
 type decision struct {
@@ -134,20 +146,16 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 		return s, false, err
 	}
 	s.size = info.Size()
-	pending := map[string]int{}
 	note := func(file string) {
-		if file = strings.TrimSpace(file); file != "" {
+		if file = strings.TrimSpace(file); file != "" && file != "/dev/null" && !scratchRepo(file) {
 			s.files = append(s.files, file)
 		}
 	}
-	asked, published := map[string]int{}, map[string]int{}
-	scripted := map[string][]string{}
-	workdir := "" // the folder a Codex call names for itself
-	run := func(id, text string) {
-		_, seenCheck := pending[id]
+	pending, asked := map[string]int{}, map[string]int{}
+	run := func(id, text, dir string, at time.Time) {
+		_, seenCommand := pending[id]
 		_, seenLookup := asked[id]
-		_, seenPR := published[id]
-		if id != "" && (seenCheck || seenLookup || seenPR) {
+		if id != "" && (seenCommand || seenLookup) {
 			return // a tool call written twice is one run
 		}
 		// Words inside a heredoc are text handed to another program, not a command run.
@@ -155,28 +163,35 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 		shell := shellOnly(text)
 		if recallCommand.MatchString(shell) {
 			asked[id] = len(s.recalls)
-			s.recalls = append(s.recalls, command{text: text, source: "tool:" + id, at: s.end})
-		} else if text != "" && (checkLike.MatchString(shell) || runsCommit(shell)) {
-			pending[id] = len(s.commands)
-			s.commands = append(s.commands, command{text: text, source: "tool:" + id, piped: pipe.MatchString(shell), at: s.end, dir: workdir})
+			s.recalls = append(s.recalls, command{text: text, source: "tool:" + id, at: at})
+			return
 		}
-		if strings.Contains(unquoted(shell), "gh pr create") {
-			published[id] = len(s.published)
-			s.published = append(s.published, command{text: text, source: "tool:" + id, at: s.end, dir: workdir})
+		c := command{text: text, source: "tool:" + id, piped: pipe.MatchString(shell), at: at, dir: dir}
+		keep := false
+		for _, step := range shellSteps(resolveDir(s.cwd, dir), text) {
+			switch {
+			case step.kind == "write":
+				note(step.to)
+			case step.kind == "check":
+				c.check, keep = true, true
+			case ghWrites[step.kind]:
+				c.github, keep = true, true
+			case step.writesHistory(), step.kind == "copy":
+				keep = true
+			}
+		}
+		if keep {
+			pending[id] = len(s.commands)
+			s.commands = append(s.commands, c)
 		}
 	}
-	finish := func(id string, failed bool, output string) {
+	finish := func(id string, failed bool, output string, at time.Time) {
 		if i, ok := pending[id]; ok {
-			s.commands[i].result = map[bool]string{false: "성공", true: "실패"}[failed]
-			if !failed && s.commands[i].piped {
-				s.commands[i].result = "끝 명령 성공"
+			c := &s.commands[i]
+			c.result, c.output, c.done = map[bool]string{false: "성공", true: "실패"}[failed], keepOutput(output), at
+			if !failed && c.piped {
+				c.result = "끝 명령 성공"
 			}
-			if runsCommit(shellOnly(s.commands[i].text)) {
-				s.commands[i].output = cut(output, 4000)
-			}
-		}
-		if i, ok := published[id]; ok {
-			s.published[i].result, s.published[i].output = map[bool]string{false: "성공", true: "실패"}[failed], cut(output, 4000)
 		}
 	}
 	answered := func(id string, failed bool, output string) {
@@ -184,6 +199,33 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 			s.recalls[i].result = recallResult(failed, output)
 		}
 	}
+	// Claude's tool calls, in the conversation and in the sub-agents it started.
+	blocks := func(message map[string]any, at time.Time) {
+		content, _ := message["content"].([]any)
+		for _, b := range content {
+			block, _ := b.(map[string]any)
+			input, _ := block["input"].(map[string]any)
+			id, _ := block["id"].(string)
+			switch {
+			case block["type"] == "tool_use" && (block["name"] == "Edit" || block["name"] == "Write" || block["name"] == "MultiEdit" || block["name"] == "NotebookEdit"):
+				file, _ := input["file_path"].(string)
+				if file == "" {
+					file, _ = input["notebook_path"].(string)
+				}
+				note(file)
+			case block["type"] == "tool_use" && block["name"] == "Bash":
+				text, _ := input["command"].(string)
+				run(id, text, "", at)
+			case block["type"] == "tool_result":
+				use, _ := block["tool_use_id"].(string)
+				finish(use, block["is_error"] == true, flatText(block["content"]), at)
+				answered(use, block["is_error"] == true, flatText(block["content"]))
+			}
+		}
+	}
+	scripted := map[string][]scriptCall{}
+	// A Codex command still running when its call returned ends in later write_stdin calls.
+	running, continued, earlier := map[string]string{}, map[string]string{}, map[string]string{}
 	scanner := bufio.NewScanner(io.LimitReader(f, s.size))
 	scanner.Buffer(make([]byte, 1<<20), 64<<20)
 	line := 0
@@ -196,10 +238,14 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 		if json.Unmarshal(scanner.Bytes(), &row) != nil {
 			return s, false, fmt.Errorf("%s:%d: 대화 행 해석 실패", path, line)
 		}
+		at := stamp(row["timestamp"])
 		if row["isSidechain"] == true {
+			// An older client wrote sub-agent turns into the conversation: their edits count, their clock does not.
+			message, _ := row["message"].(map[string]any)
+			blocks(message, at)
 			continue
 		}
-		if at := stamp(row["timestamp"]); !at.IsZero() {
+		if !at.IsZero() {
 			if s.start.IsZero() {
 				s.start = at
 			}
@@ -216,29 +262,15 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 			if v, _ := row["sessionId"].(string); v != "" {
 				s.id = v
 			}
+			if url, _ := row["prUrl"].(string); row["type"] == "pr-link" && url != "" && !slices.Contains(s.prLinks, url) {
+				s.prLinks = append(s.prLinks, url)
+			}
 			message, _ := row["message"].(map[string]any)
 			// Claude writes its compaction summary as plain text; each one restates the ones before.
 			if text, _ := message["content"].(string); row["isCompactSummary"] == true && text != "" {
 				s.compact = text
 			}
-			blocks, _ := message["content"].([]any)
-			for _, b := range blocks {
-				block, _ := b.(map[string]any)
-				input, _ := block["input"].(map[string]any)
-				id, _ := block["id"].(string)
-				switch {
-				case block["type"] == "tool_use" && (block["name"] == "Edit" || block["name"] == "Write" || block["name"] == "MultiEdit" || block["name"] == "NotebookEdit"):
-					file, _ := input["file_path"].(string)
-					note(file)
-				case block["type"] == "tool_use" && block["name"] == "Bash":
-					text, _ := input["command"].(string)
-					run(id, text)
-				case block["type"] == "tool_result":
-					use, _ := block["tool_use_id"].(string)
-					finish(use, block["is_error"] == true, flatText(block["content"]))
-					answered(use, block["is_error"] == true, flatText(block["content"]))
-				}
-			}
+			blocks(message, s.end)
 			continue
 		}
 		switch {
@@ -260,35 +292,42 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 				note(m[1])
 			}
 			var call struct {
-				Cmd     string   `json:"cmd"`
-				Command []string `json:"command"`
-				Workdir string   `json:"workdir"`
+				Cmd       string   `json:"cmd"`
+				Command   []string `json:"command"`
+				Workdir   string   `json:"workdir"`
+				SessionID any      `json:"session_id"`
 			}
 			json.Unmarshal([]byte(args), &call)
 			id, _ := payload["call_id"].(string)
-			workdir = call.Workdir
-			if call.Cmd != "" {
-				run(id, call.Cmd)
-			} else {
-				run(id, strings.Join(call.Command, " "))
+			if origin, ok := running[fmt.Sprint(call.SessionID)]; ok && payload["name"] == "write_stdin" {
+				continued[id] = origin
 			}
-			workdir = ""
-			// The app runs commands from a script, several at once; only memory lookups are read from it.
+			if call.Cmd != "" {
+				run(id, call.Cmd, call.Workdir, s.end)
+			} else {
+				run(id, strings.Join(call.Command, " "), call.Workdir, s.end)
+			}
+			// The app also runs commands from a script, several at once.
 			scripted[id] = scriptCommands(args)
-			for i, text := range scripted[id] {
-				if recallCommand.MatchString(text) {
-					run(fmt.Sprintf("%s#%d", id, i), text)
-				}
+			for i, c := range scripted[id] {
+				run(fmt.Sprintf("%s#%d", id, i), c.cmd, c.workdir, s.end)
 			}
 		case row["type"] == "response_item" && (payload["type"] == "function_call_output" || payload["type"] == "custom_tool_call_output"):
 			id, _ := payload["call_id"].(string)
-			out, _ := json.Marshal(payload["output"])
-			m := exitCode.FindSubmatch(out)
-			if m != nil {
-				finish(id, string(m[1]) != "0", flatText(payload["output"]))
+			results := scriptResults(payload["output"], len(scripted[id]))
+			if origin, ok := continued[id]; ok {
+				id = origin
 			}
-			answered(id, m != nil && string(m[1]) != "0", flatText(payload["output"]))
-			for _, r := range scriptResults(payload["output"], len(scripted[id])) {
+			output := flatText(payload["output"])
+			exit := exitCode.FindStringSubmatch(output)
+			if exit != nil {
+				finish(id, exit[1] != "0", earlier[id]+output, s.end)
+			} else if m := stillRunning.FindStringSubmatch(output); m != nil {
+				running[m[1]], earlier[id] = id, earlier[id]+output+"\n"
+			}
+			answered(id, exit != nil && exit[1] != "0", output)
+			for _, r := range results {
+				finish(fmt.Sprintf("%s#%d", id, r.index), r.failed, r.output, s.end)
 				answered(fmt.Sprintf("%s#%d", id, r.index), r.failed, r.output)
 			}
 		}
@@ -298,6 +337,24 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 	}
 	if err := scanner.Err(); err != nil {
 		return s, false, err
+	}
+	if tool == "claude" {
+		// Sub-agents keep their own transcripts beside the conversation's. One being written may end
+		// in half a line; what it did before stays readable.
+		agents, _ := filepath.Glob(filepath.Join(strings.TrimSuffix(path, ".jsonl"), "subagents", "*.jsonl"))
+		for _, agent := range agents {
+			raw, err := os.ReadFile(agent)
+			if err != nil {
+				continue
+			}
+			for line := range bytes.Lines(raw) {
+				var row map[string]any
+				if json.Unmarshal(line, &row) == nil {
+					message, _ := row["message"].(map[string]any)
+					blocks(message, stamp(row["timestamp"]))
+				}
+			}
+		}
 	}
 	s.requests, s.reports, err = worklog.ReadConversation(path)
 	if err != nil {
@@ -315,6 +372,8 @@ func readSessionChecked(tool, path string) (session, bool, error) {
 		return s, false, err
 	}
 	s.files = relative(s.cwd, s.files)
+	s.omitted = max(0, len(s.files)-maxFiles)
+	s.files = s.files[s.omitted:]
 	return s, len(s.requests) > 0, nil
 }
 
@@ -338,7 +397,7 @@ func relative(cwd string, files []string) []string {
 			out = append([]string{file}, out...)
 		}
 	}
-	return out[max(0, len(out)-maxFiles):]
+	return out
 }
 
 // short is the 8 characters that tell sessions apart in file names. Codex ids are UUIDv7, whose
@@ -512,25 +571,59 @@ func render(s session, m summary, summarized bool) string {
 	}
 	b.WriteString("\n## 자료\n")
 	section("바뀐 파일", s.files)
-	var checks, commits []string
+	if s.omitted > 0 {
+		fmt.Fprintf(&b, "(그 앞에 바꾼 파일 %d개는 원문에 있다)\n", s.omitted)
+	}
+	var checks, github []string
 	for _, c := range s.commands {
 		line := "`" + cut(c.text, 200) + "`"
-		if subjects := commitSubjects(c.text); len(subjects) > 0 {
-			line = subjects[0] // the subject says what was committed; the shell line does not
-		}
 		if c.result != "" {
 			line += " → " + c.result
 		}
-		line += " [" + c.source + "]"
-		if runsCommit(shellOnly(c.text)) && !scratchRepo(commandDir(resolveDir(s.cwd, c.dir), shellOnly(c.text))) {
-			commits = append(commits, line)
-		} else {
-			checks = append(checks, line)
+		switch {
+		case c.github:
+			// "PR #12" is how a person asks for it later.
+			if m := prLinkRe.FindStringSubmatch(c.output); m != nil {
+				line += " · PR #" + m[3] + " " + m[0]
+			}
+			github = append(github, line+" ["+c.source+"]")
+		case c.check:
+			checks = append(checks, line+" ["+c.source+"]")
 		}
 	}
-	// Each keeps its latest, so a long run of checks never pushes a commit out.
+	for _, url := range s.prLinks {
+		if m := prLinkRe.FindStringSubmatch(url); m != nil && !slices.ContainsFunc(github, func(line string) bool { return strings.Contains(line, m[0]) }) {
+			github = append(github, "PR #"+m[3]+" "+m[0]+" (대화에 연결된 PR)")
+		}
+	}
+	// git's own record of what was made; the shell line may hide it behind -q, a pipe or a variable.
+	var commits, pushes, copies []string
+	for _, e := range s.events {
+		where := strings.TrimSpace(e.repo + " " + e.ref)
+		if e.root != "" && e.origin == "" {
+			where += ", 원격 없음"
+		}
+		hash := e.hash[:min(8, len(e.hash))]
+		switch {
+		case e.kind == "commit" && hash != "":
+			commits = append(commits, hash+" "+e.subject+" ("+where+") ["+e.source+"]")
+		case e.kind == "commit":
+			commits = append(commits, e.subject+" ("+where+", 해시 모름) ["+e.source+"]")
+		case hash != "":
+			pushes = append(pushes, where+" ← "+hash+" ["+e.source+"]")
+		default:
+			pushes = append(pushes, where+" (새 브랜치) ["+e.source+"]")
+		}
+	}
+	for _, pair := range s.copies {
+		copies = append(copies, pair[0]+" → "+pair[1])
+	}
+	// Checks keep their latest; what was made is never cut.
 	section("검사", checks[max(0, len(checks)-maxCommands):])
-	section("커밋", commits[max(0, len(commits)-maxCommands):])
+	section("커밋", commits)
+	section("push", pushes)
+	section("GitHub", github)
+	section("레포 사이 복사", copies)
 	var recalls []string
 	for _, c := range s.recalls[max(0, len(s.recalls)-maxCommands):] {
 		line := "`" + cut(c.text, 200) + "`"
@@ -548,30 +641,54 @@ func render(s session, m summary, summarized bool) string {
 }
 
 var (
-	scriptCall    = regexp.MustCompile(`\btools\.(\w+)\(`)
-	scriptCommand = regexp.MustCompile(`\bcmd:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|` + "`[^`]*`" + `)`)
+	scriptTool    = regexp.MustCompile(`\btools\.(\w+)\(`)
+	scriptCommand = regexp.MustCompile(`(?:\bcmd|"cmd"|'cmd')\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|` + "`[^`]*`" + `)`)
+	scriptWorkdir = regexp.MustCompile(`(?:\bworkdir|"workdir"|'workdir')\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')`)
 )
+
+type scriptCall struct{ cmd, workdir string }
+
+// scriptLiteral is a string as the script spells it, quotes removed.
+func scriptLiteral(quoted string) string {
+	if text, err := strconv.Unquote(quoted); err == nil && quoted[0] == '"' {
+		return text
+	}
+	return quoted[1 : len(quoted)-1]
+}
 
 // scriptCommands are the tool calls a Codex app script makes, in order. Results are numbered by
 // place, so a call that is not exec_command, or whose command is not written out, keeps its place empty.
-func scriptCommands(script string) []string {
-	calls := scriptCall.FindAllStringSubmatchIndex(script, -1)
-	var out []string
+func scriptCommands(script string) []scriptCall {
+	calls := scriptTool.FindAllStringSubmatchIndex(script, -1)
+	var out []scriptCall
 	for i, call := range calls {
 		end := len(script)
 		if i+1 < len(calls) {
 			end = calls[i+1][0]
 		}
-		text := ""
+		var c scriptCall
 		if m := scriptCommand.FindStringSubmatch(script[call[1]:end]); m != nil && script[call[2]:call[3]] == "exec_command" {
-			text = m[1][1 : len(m[1])-1]
-			if unquoted, err := strconv.Unquote(m[1]); err == nil && m[1][0] == '"' {
-				text = unquoted
+			c.cmd = scriptLiteral(m[1])
+			if w := scriptWorkdir.FindStringSubmatch(script[call[1]:end]); w != nil {
+				c.workdir = scriptLiteral(w[1])
 			}
 		}
-		out = append(out, text)
+		out = append(out, c)
 	}
 	return out
+}
+
+// keepOutput cuts a long output, keeping past the cut the lines that say what git or gh made.
+func keepOutput(output string) string {
+	kept := cut(output, 4000)
+	if kept == output {
+		return output
+	}
+	rest := string([]rune(output)[4000:])
+	if made := madeLine.FindAllString(rest, -1); len(made) > 0 {
+		kept += "\n" + strings.Join(made, "\n")
+	}
+	return kept
 }
 
 type scriptResult struct {
@@ -649,13 +766,11 @@ func scriptResults(v any, calls int) []scriptResult {
 	return inOrder
 }
 
-// runsCommit says a shell line runs a commit itself, "git commit" or "git -C <dir> commit".
-func runsCommit(shell string) bool { return gitCommit.MatchString(unquoted(shell)) }
-
 // commitSubjects are the -m subjects of the commits a command runs. An unquoted one ends where the
 // shell ends the word, so "-m init && cd x" is "init".
 func commitSubjects(command string) []string {
 	var out []string
+	given := map[int]bool{} // where a commit with -m starts
 	for _, m := range commitMessage.FindAllStringSubmatchIndex(command, -1) {
 		subject := command[m[2]:m[3]]
 		if before := command[m[2]-1]; before != '"' && before != '\'' && before != '\n' {
@@ -663,9 +778,44 @@ func commitSubjects(command string) []string {
 				subject = subject[:end]
 			}
 		}
+		given[m[0]] = true
 		out = append(out, strings.TrimSpace(subject))
 	}
+	for _, m := range commitFile.FindAllStringSubmatchIndex(command, -1) {
+		if !given[m[0]] {
+			if subject := heredocSubject(command, m[1], strings.Trim(command[m[2]:m[3]], `'"`)); subject != "" {
+				out = append(out, subject)
+			}
+		}
+	}
 	return out
+}
+
+// heredocSubject is the first line of the heredoc that gives a commit ending at end its message:
+// one on the commit's own line when it reads its input, else one written to its message file.
+func heredocSubject(command string, end int, file string) string {
+	for _, m := range heredoc.FindAllStringSubmatchIndex(command, -1) {
+		lineStart := strings.LastIndexByte(command[:m[0]], '\n') + 1
+		nl := strings.IndexByte(command[m[1]:], '\n')
+		if nl < 0 {
+			break
+		}
+		head := command[lineStart : m[1]+nl]
+		if file == "-" && (m[0] < end || strings.Contains(command[end:m[0]], "\n")) ||
+			file != "-" && !strings.Contains(strings.ReplaceAll(head, " ", ""), ">"+file) {
+			continue
+		}
+		word := command[m[2]:m[3]]
+		for _, line := range strings.Split(command[m[1]+nl+1:], "\n") {
+			if strings.TrimLeft(line, "\t") == word {
+				break
+			}
+			if line = strings.TrimSpace(line); line != "" {
+				return line
+			}
+		}
+	}
+	return ""
 }
 
 // unquoted drops what is inside quotes: there the words are an argument, like a pattern handed to
@@ -837,11 +987,18 @@ func Build(since time.Time, useModel bool, now time.Time) (map[string]any, error
 type summaryCall func(session, summary, int) (summary, int, error)
 
 func build(since time.Time, useModel bool, now time.Time, call summaryCall) (map[string]any, error) {
-	return buildWithRecordWrite(since, useModel, now, call, memory.PrivateWrite)
+	return buildWithRecordWrite(since, useModel, now, call, memory.PrivateWrite, "")
 }
 
-// The write seam exercises failures both before and after atomic replacement.
-func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call summaryCall, writeRecord func(string, []byte) error) (map[string]any, error) {
+// BuildConversation records one archived conversation now, as its Stop hook keeps it: the next start
+// card and the ledger need not wait for the next session's sweep.
+func BuildConversation(raw string, now time.Time) (map[string]any, error) {
+	return buildWithRecordWrite(time.Time{}, false, now, summarizeNext, memory.PrivateWrite, raw)
+}
+
+// The write seam exercises failures both before and after atomic replacement. only, when set, is
+// the one archived transcript to record.
+func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call summaryCall, writeRecord func(string, []byte) error, only string) (map[string]any, error) {
 	if os.Getenv("HARNESS_RECALL") == "1" {
 		return nil, nil
 	}
@@ -904,7 +1061,14 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 		}
 		items = append(items, item{tool: tool, path: path, at: at})
 	}
+	if only != "" {
+		// raw/<tool>/<day>/<file>
+		add(filepath.Base(filepath.Dir(filepath.Dir(only))), only)
+	}
 	for _, tool := range []string{"claude", "codex"} {
+		if only != "" {
+			break
+		}
 		days, err := os.ReadDir(filepath.Join(RawDir(), tool))
 		if err != nil && !os.IsNotExist(err) {
 			return nil, err
@@ -928,7 +1092,7 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 	}
 	// Old pending records still need retries after they leave the discovery window.
 	for path, p := range prior {
-		if !seen[path] && p.pending {
+		if !seen[path] && p.pending && only == "" {
 			if p.tool == "claude" || p.tool == "codex" {
 				add(p.tool, path)
 			}
@@ -956,7 +1120,8 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 			return nil, err
 		}
 	}
-	written, failed := []string{}, discoveryFailed
+	written, failed, retired := []string{}, discoveryFailed, []string{}
+	var git *gitCache // one for the whole build: conversations share repositories
 	var facts *factWriter
 	var factsErr error
 	summarized, attempts := 0, 0
@@ -1003,6 +1168,11 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 		}
 		if !ok {
 			skip[it.path] = hash
+			// The reader no longer finds the person's words here, as in a transcript of /clear alone.
+			// A record made from the transcript alone would only clutter search; a model summary stays.
+			if prev != "" && prior.field("summary_data") == "" && os.Remove(prev) == nil {
+				retired = append(retired, prev)
+			}
 			continue
 		}
 		if parsed.hash != hash {
@@ -1064,6 +1234,10 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 				}
 			}
 		}
+		if git == nil {
+			git = newGitCache()
+		}
+		git.readGit(&parsed)
 		dest := prev
 		if dest == "" {
 			dest = filepath.Join(RecordDir(), parsed.start.Local().Format("2006-01-02"), parsed.start.Local().Format("1504")+"-"+RepoName(parsed.cwd)+"-"+key+".md")
@@ -1110,5 +1284,5 @@ func buildWithRecordWrite(since time.Time, useModel bool, now time.Time, call su
 	if storedPending, storedUnresolved := storedSummaryCounts(); storedPending != nil {
 		pending, unresolved = *storedPending, *storedUnresolved
 	}
-	return map[string]any{"written": len(written), "summarized": summarized, "summary_attempts": attempts, "unresolved": unresolved, "pending": pending, "failed": failed, "files": written, "storage_uncertain": storageUncertain}, nil
+	return map[string]any{"written": len(written), "summarized": summarized, "summary_attempts": attempts, "unresolved": unresolved, "pending": pending, "failed": failed, "files": written, "retired": retired, "storage_uncertain": storageUncertain}, nil
 }

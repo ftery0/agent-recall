@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type resumeRecord struct {
@@ -24,6 +25,7 @@ type resumeRecord struct {
 	ended                          time.Time
 	last                           string // the agent's answer to the last request, read from the transcript
 	rawError                       bool
+	elsewhere                      bool // run in another folder, it changed this repository
 }
 
 // Read location metadata without loading the rest of the conversation.
@@ -166,11 +168,12 @@ func requestView(requests []worklog.Request, count, budget int) string {
 	sort.SliceStable(recent, func(i, j int) bool { return recent[i].Line > recent[j].Line })
 	shown := ""
 	for _, r := range recent {
-		// A resent long request says nothing new; short answers like "1번" can mean different things.
-		if r.Text == shown && len([]rune(r.Text)) > 16 {
+		// A resent request says nothing new, its punctuation aside; short answers like "1번" can mean
+		// different things.
+		if said := squash(r.Text); said == shown && len([]rune(said)) > 8 {
 			continue
 		}
-		shown = r.Text
+		shown = squash(r.Text)
 		prefix := fmt.Sprintf("  [%s 줄%d] ", r.ID, r.Line)
 		room := budget - len([]rune(b.String()+prefix+"\n"))
 		if room < 16 {
@@ -188,6 +191,27 @@ func requestView(requests []worklog.Request, count, budget int) string {
 	return b.String()
 }
 
+// squash keeps a text's letters and digits, lowered: what it says, without how it was typed.
+func squash(text string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return unicode.ToLower(r)
+		}
+		return -1
+	}, text)
+}
+
+// earlierAction is the latest request before the last shown that sent work out — a commit, a push,
+// a deploy — in a conversation long enough to have moved on from it.
+func earlierAction(requests []worklog.Request, shown int) (worklog.Request, bool) {
+	for i := len(requests) - shown - 1; i >= 0; i-- {
+		if r := requests[i]; r.QuestionID == "" && actionWords.MatchString(r.Text) {
+			return r, true
+		}
+	}
+	return worklog.Request{}, false
+}
+
 func appendViewLine(b *strings.Builder, line string, budget int) {
 	if len([]rune(b.String()+line+"\n")) <= budget {
 		b.WriteString(line + "\n")
@@ -197,6 +221,9 @@ func appendViewLine(b *strings.Builder, line string, budget int) {
 func recordView(record resumeRecord, budget int) string {
 	var b strings.Builder
 	heading := "- 목표/제목: " + cut(mask(record.m.Title), 60)
+	if record.elsewhere {
+		heading += " (다른 폴더 " + record.cwd + " 의 대화가 이 레포를 고침)"
+	}
 	if len(record.requests) > 1 {
 		// A long conversation keeps its first request as its title after the work moved on.
 		heading += " (처음 요청 — 지금 일은 아래 최신 원문)"
@@ -211,6 +238,9 @@ func recordView(record resumeRecord, budget int) string {
 		// The requests leave room for where the conversation stopped and what git says of it now.
 		room := budget - len([]rune(b.String()+ending+check)) - 2
 		b.WriteString(requestView(record.requests, 4, min(max(0, room), budget*3/5)))
+		if r, ok := earlierAction(record.requests, 4); ok {
+			appendViewLine(&b, fmt.Sprintf("  앞선 행동 요청: [%s 줄%d] %s", r.ID, r.Line, requestExcerpt(r, 90)), budget)
+		}
 	}
 	if ending != "" {
 		appendViewLine(&b, ending, budget)
@@ -263,7 +293,8 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 	}
 	cwd = filepath.Clean(cwd)
 	root := worklog.RepoRoot(cwd)
-	roots := map[string]string{cwd: root}
+	main := mainRoot(root) // a linked worktree is the repository it belongs to
+	roots := map[string]string{cwd: main}
 	matchesFolder := func(other string) bool {
 		if other == "" {
 			return false
@@ -277,10 +308,29 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 		}
 		otherRoot, ok := roots[other]
 		if !ok {
-			otherRoot = worklog.RepoRoot(other)
+			otherRoot = mainRoot(worklog.RepoRoot(other))
 			roots[other] = otherRoot
 		}
-		return otherRoot == root
+		return otherRoot == main
+	}
+	// A conversation in another folder that changed files here, or committed here, worked on this
+	// repository too.
+	name := RepoName(cwd)
+	touches := func(rec record, folder string) bool {
+		if root == "" {
+			return false
+		}
+		for _, file := range rec.items("바뀐 파일") {
+			if path := resolveDir(folder, file); strings.HasPrefix(path, root+"/") || strings.HasPrefix(path, main+"/") {
+				return true
+			}
+		}
+		for _, item := range append(rec.items("커밋"), rec.items("push")...) {
+			if strings.Contains(item, "("+name+" ") || strings.Contains(item, "("+name+",") || strings.Contains(item, "("+name+")") || strings.HasPrefix(item, name+" ") {
+				return true
+			}
+		}
+		return false
 	}
 	stored, readErrors := loadRecords()
 	var records []resumeRecord
@@ -292,8 +342,11 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 		if folder == "" {
 			folder, _, _ = transcriptMetadata(rawPath)
 		}
+		elsewhere := false
 		if !matchesFolder(folder) {
-			continue
+			if elsewhere = touches(rec, folder); !elsewhere {
+				continue
+			}
 		}
 		m, _ := rec.summary()
 		if m.Title == "" {
@@ -309,7 +362,7 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 			}
 		}
 		if unfinished(m, state) {
-			records = append(records, resumeRecord{path: rec.path, raw: rawPath, session: rec.field("session"), files: rec.items("바뀐 파일"), ended: rec.ended(), cwd: folder, state: state, m: m, when: when})
+			records = append(records, resumeRecord{path: rec.path, raw: rawPath, session: rec.field("session"), files: rec.items("바뀐 파일"), ended: rec.ended(), cwd: folder, state: state, m: m, when: when, elsewhere: elsewhere})
 		}
 	}
 	// Stop archives immediately; the summary collector may not have run yet. Inspect only
@@ -446,8 +499,13 @@ func ResumeText(cwd, transcriptPath string) (string, error) {
 	}
 	var b strings.Builder
 	b.WriteString("=== 작업 이어가기 — 현재 사용자 원문이 과거 요약보다 우선 ===\n과거 승인은 새 실행 권한이 아니다. AI 보고는 완료 증거가 아니다.\n")
+	// Where this repository's work can go, when that is unusual: no remote, or copied to another.
+	lines, _ := readFacts()
+	if note := repoNote(root, foldFacts(lines), false); note != "" {
+		b.WriteString(note + "\n")
+	}
 	if totalCandidates > 1 {
-		fmt.Fprintf(&b, "작업 후보 %d개 중 최근 %d개. 첫 사용자 요청으로 작업을 좁힌다.\n", totalCandidates, len(records))
+		fmt.Fprintf(&b, "이 레포 대화 %d개 중 최근 %d개. 지금 일은 첫 사용자 요청으로 좁힌다.\n", totalCandidates, len(records))
 	} else if len(records) == 1 {
 		label := "같은 폴더의 작업 후보"
 		if selected {

@@ -465,13 +465,13 @@ func exclusive(path string) (*os.File, error) {
 	return f, nil
 }
 
-// SweepInBackground starts a detached sync (copy, then records) so the session-start hook never waits.
-func SweepInBackground() {
+// RunInBackground runs this program with args in a detached process, so the hook never waits.
+func RunInBackground(args ...string) {
 	exe, err := os.Executable()
 	if err != nil || os.Getenv("HARNESS_RECALL") == "1" {
 		return
 	}
-	cmd := exec.Command(exe, "recall", "sync")
+	cmd := exec.Command(exe, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if cmd.Start() == nil {
 		cmd.Process.Release()

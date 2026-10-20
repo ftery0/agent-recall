@@ -73,6 +73,16 @@ func run(args []string) (any, error) {
 			}
 		}
 		output, err := adapters.StructureHook(args[1], payload)
+		// Codex has one hook before its tools; the memory of the repositories a command touches rides on
+		// it. The edit scope only ever answers with a decision, a reason or a system message.
+		if args[1] == "codex" && len(args) == 2 {
+			if action, ok := actionHook(payload).(memory.Object); ok {
+				if output == nil {
+					output = memory.Object{}
+				}
+				output["hookSpecificOutput"] = action["hookSpecificOutput"]
+			}
+		}
 		if output == nil {
 			return nil, err
 		}
@@ -103,8 +113,8 @@ func run(args []string) (any, error) {
 		return structureOutput{output, code, false}, nil
 	}
 	if args[0] == "worklog" {
-		if len(args) != 3 || (args[1] != "claude" && args[1] != "codex") || !slices.Contains([]string{"start", "prompt", "stop", "batch", "precompact"}, args[2]) {
-			return nil, errors.New("use: worklog claude|codex start|prompt|stop|batch|precompact")
+		if len(args) != 3 || (args[1] != "claude" && args[1] != "codex") || !slices.Contains([]string{"start", "prompt", "stop", "batch", "precompact", "action"}, args[2]) {
+			return nil, errors.New("use: worklog claude|codex start|prompt|stop|batch|precompact|action")
 		}
 		// A broken payload must never fail the client's hook, so it simply produces no card or block.
 		raw, err := adapters.ReadInput("-")
@@ -122,19 +132,27 @@ func run(args []string) (any, error) {
 			}
 			return nil, nil
 		case "precompact":
+			// The summary may drop what the action hook said; it may say it again after.
+			recall.ForgetActions(memory.Text(payload["session_id"]))
 			// Printed text, exit 0: a PreCompact hook's exit 2 would block the compaction.
 			return worklog.CompactInstruction, nil
 		case "prompt":
 			return promptHook(payload, time.Now()), nil
+		case "action":
+			return actionHook(payload), nil
 		}
 		if args[2] == "start" {
-			recall.SweepInBackground()
+			// A sync copies what is missing, then records it.
+			recall.RunInBackground("recall", "sync")
 			return startCard(args[1], payload), nil
 		}
 		if path := memory.Text(payload["transcript_path"]); path != "" {
-			if _, err := recall.Archive(path, recall.Dest(recall.RawDir(), args[1], path)); err != nil {
+			dest := recall.Dest(recall.RawDir(), args[1], path)
+			if _, err := recall.Archive(path, dest); err != nil {
 				return "기억 원본 보관 미완료: " + err.Error() + " — 다음 수집에서 재시도한다.", nil
 			}
+			// What this turn did is in the record and the ledger before the next conversation starts.
+			recall.RunInBackground("recall", "build", "--only", dest)
 		}
 		return nil, nil
 	}
@@ -184,12 +202,13 @@ func run(args []string) (any, error) {
 			review := f.Bool("review", false, "AI proposals and conflicts waiting on the person")
 			online := f.Bool("online", false, "also ask GitHub about pull requests")
 			backfill := f.Bool("backfill", false, "read every recorded conversation again for its facts")
+			rebuild := f.Bool("rebuild", false, "start the ledger again from every conversation, keeping the old one and the person's decisions")
 			limit := f.Int("limit", 20, "fact count")
 			if err := f.Parse(flagsFirst(args[2:], "limit")); err != nil {
 				return nil, err
 			}
-			if *backfill {
-				return recall.BackfillFacts(time.Now())
+			if *backfill || *rebuild {
+				return recall.BackfillFacts(time.Now(), *rebuild)
 			}
 			return recall.FactsText(strings.Join(f.Args(), " "), *review, *online, *limit)
 		}
@@ -216,8 +235,12 @@ func run(args []string) (any, error) {
 			// Records come from the transcript alone; the summary model runs only when asked by hand.
 			model := b.Bool("model", false, "also ask the summary model (manual)")
 			b.Bool("no-model", true, "the default; kept so older commands still run")
+			only := b.String("only", "", "record this one archived transcript")
 			if e := b.Parse(args[2:]); e != nil {
 				return nil, e
+			}
+			if *only != "" {
+				return recall.BuildConversation(*only, time.Now())
 			}
 			day, e := time.ParseInLocation("2006-01-02", *since, time.Local)
 			if e != nil {
@@ -272,7 +295,7 @@ func parseSince(value string) (time.Time, error) {
 // the agents' memory lookups went. Both clients read the same JSON; nothing found prints nothing.
 func promptHook(payload memory.Object, now time.Time) any {
 	out := memory.Object{}
-	if hint := recall.HintText(memory.Text(payload["prompt"]), memory.Text(payload["cwd"]), memory.Text(payload["session_id"]), now); hint != "" {
+	if hint := recall.HintText(memory.Text(payload["prompt"]), memory.Text(payload["cwd"]), memory.Text(payload["session_id"]), memory.Text(payload["transcript_path"]), now); hint != "" {
 		out["hookSpecificOutput"] = memory.Object{"hookEventName": "UserPromptSubmit", "additionalContext": hint}
 	}
 	if notice := recall.MissesNotice(now); notice != "" {
@@ -282,6 +305,25 @@ func promptHook(payload memory.Object, now time.Time) any {
 		return nil
 	}
 	return out
+}
+
+// actionHook adds, before a shell command that commits, pushes, copies between repositories or
+// changes GitHub, what memory holds about the repositories it touches. Nothing unusual adds nothing.
+func actionHook(payload memory.Object) any {
+	// Codex runs the same hook after its tools too; by then the command has run.
+	if event := memory.Text(payload["hook_event_name"]); event != "" && event != "PreToolUse" {
+		return nil
+	}
+	input, _ := payload["tool_input"].(map[string]any)
+	command := memory.Text(input["command"]) + memory.Text(input["cmd"])
+	if command == "" {
+		return nil
+	}
+	text := recall.ActionText(command, memory.Text(payload["cwd"]), memory.Text(payload["session_id"]), memory.Text(payload["transcript_path"]))
+	if text == "" {
+		return nil
+	}
+	return memory.Object{"hookSpecificOutput": memory.Object{"hookEventName": "PreToolUse", "additionalContext": text}}
 }
 
 // flagsFirst moves flags ahead of the words, so "source ID 말 --limit 2" reads like

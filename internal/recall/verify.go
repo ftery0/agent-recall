@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/ftery0/agent-recall/internal/worklog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -26,28 +27,31 @@ func commitState(root, hash, subject string) string {
 		return "확인 불가(레포 폴더 없음)"
 	}
 	if hash == "" {
-		found, ok := worklog.Git(root, gitLimit, "log", "--all", "-1", "--format=%h", "--fixed-strings", "--grep="+subject)
-		if !ok {
-			return "확인 불가(git 실패)"
-		}
-		if found == "" {
+		if hash = sameSubject(root, subject, "--all"); hash == "" {
 			return "이 컴퓨터 git 기록에 없음"
 		}
-		hash = found
 	}
 	if _, ok := worklog.Git(root, gitLimit, "cat-file", "-e", hash+"^{commit}"); !ok {
 		return "이 컴퓨터 git 기록에 없음"
 	}
+	name := hash[:min(8, len(hash))]
 	remote, ok := worklog.Git(root, gitLimit, "branch", "-r", "--contains", hash)
 	switch {
 	case !ok:
 		return "커밋 있음 · 원격 확인 불가"
 	case remote == "":
 		// A commit no branch holds was reset or rewritten away; it is not one waiting to be pushed.
+		// A commit with its subject on a branch is the version that replaced it.
 		if local, ok := worklog.Git(root, gitLimit, "branch", "--contains", hash); ok && local == "" {
-			return "커밋 " + hash + " 어느 브랜치에도 없음(취소됐거나 다시 쓴 커밋)"
+			if again := sameSubject(root, subject, "--branches", "--remotes"); again != "" {
+				return "커밋 " + name + " 은 다시 쓰임 → 새 판 " + strings.TrimPrefix(commitState(root, again, ""), "커밋 ")
+			}
+			return "커밋 " + name + " 어느 브랜치에도 없음(취소됐거나 다시 쓴 커밋)"
 		}
-		return "커밋 " + hash + " 있음 · 원격 브랜치에 없음(안 올림)"
+		if remotes, _ := worklog.Git(root, gitLimit, "remote"); remotes == "" {
+			return "커밋 " + name + " 있음 · 원격 없는 레포"
+		}
+		return "커밋 " + name + " 있음 · 원격 브랜치에 없음(안 올림" + fetched(root) + ")"
 	}
 	// Long-lived branches first: being in main or dev says more than a feature branch does.
 	var branches []string
@@ -69,7 +73,40 @@ func commitState(root, hash, subject string) string {
 	if len(branches) > 2 {
 		shown += fmt.Sprintf(" 외 %d", len(branches)-2)
 	}
-	return "커밋 " + hash + " 있음 · " + shown + " 에 올라감"
+	return "커밋 " + name + " 있음 · " + shown + " 에 올라감"
+}
+
+// sameSubject is the newest commit in refs whose subject is exactly subject; a word of it would
+// find other commits.
+func sameSubject(root, subject string, refs ...string) string {
+	if subject == "" {
+		return ""
+	}
+	args := append(append([]string{"log"}, refs...), "--fixed-strings", "--grep="+subject, "--format=%H%x09%s", "-50")
+	out, _ := worklog.Git(root, gitLimit, args...)
+	for _, line := range strings.Split(out, "\n") {
+		if hash, s, ok := strings.Cut(line, "\t"); ok && s == subject {
+			return hash
+		}
+	}
+	return ""
+}
+
+// fetched says when the remote branches were last fetched, once that is over a day ago: a commit
+// not on them may have been pushed from elsewhere since.
+func fetched(root string) string {
+	dir, ok := worklog.Git(root, gitLimit, "rev-parse", "--git-common-dir")
+	if !ok {
+		return ""
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(root, dir)
+	}
+	info, err := os.Stat(filepath.Join(dir, "FETCH_HEAD"))
+	if err != nil || time.Since(info.ModTime()) < 24*time.Hour {
+		return ""
+	}
+	return ", 원격 정보는 " + info.ModTime().Format("01-02") + " 에 받아 온 것"
 }
 
 // prState is a pull request's merge as the local history knows it; online asks GitHub as well.
@@ -93,20 +130,39 @@ func prState(root, owner, repo, n string, online bool) string {
 	return state + " · GitHub: " + strings.TrimSpace(string(raw))
 }
 
-// repoFolder is the local clone for a GitHub repository: the folder the fact was seen in, or a
-// git folder beside it whose origin names that repository.
+// repoFolder is the local clone for a GitHub repository: the folder the fact was seen in, or a git
+// folder beside it, whose origin names that repository, else whose folder does (GitHub may have
+// renamed it since). None is "": another repository's history would answer for this one.
 func repoFolder(cwd, repo string) string {
 	root := worklog.RepoRoot(cwd)
 	if root == "" || repo == "" {
 		return root
 	}
 	candidates, _ := filepath.Glob(filepath.Join(filepath.Dir(root), "*"))
-	for _, dir := range append([]string{root}, candidates...) {
+	candidates = append([]string{root}, candidates...)
+	for _, dir := range candidates {
 		if worklog.OriginName(dir) == repo {
 			return dir
 		}
 	}
-	return root
+	for _, dir := range candidates {
+		if filepath.Base(dir) == repo && worklog.RepoRoot(dir) == dir {
+			return dir
+		}
+	}
+	return ""
+}
+
+// commitRoot is the repository to check a commit claim in: the folder it was made in, else, when
+// that is gone, a clone of the same remote beside the conversation's repository.
+func commitRoot(ev factEvidence, cwd string) string {
+	if root := worklog.RepoRoot(ev.Cwd); root != "" {
+		return root
+	}
+	if ev.Origin != "" {
+		return repoFolder(cwd, originRepo(ev.Origin))
+	}
+	return ""
 }
 
 // verifyFact is a commit's or pull request's state now; other facts have nothing to check.
@@ -117,8 +173,8 @@ func verifyFact(f factState, online bool) string {
 	}
 	parts := strings.Split(f.Slot, "/")
 	switch {
-	case parts[0] == "commit":
-		return commitState(worklog.RepoRoot(cwd), f.Ref, f.Value)
+	case parts[0] == "commit" && len(f.Claims) > 0:
+		return commitState(commitRoot(f.Claims[0].Evidence, cwd), f.Ref, f.Value)
 	case parts[0] == "pr" && len(parts) == 4:
 		return prState(repoFolder(cwd, parts[2]), parts[1], parts[2], parts[3], online)
 	}
@@ -167,11 +223,11 @@ func sessionCheck(session, cwd string, files []string, ended, now time.Time) str
 				continue
 			}
 			switch {
-			case parts[0] == "commit" && commits < 2 && !scratchRepo(c.Evidence.Cwd):
+			case parts[0] == "commit" && commits < 2 && !(scratchRepo(c.Evidence.Cwd) && c.Evidence.Origin == ""):
 				// The commit's own folder: a conversation in one repository can commit in another.
 				// When that folder is gone, as a removed worktree or one named by a shell variable,
 				// the conversation's repository may share its commits; only a hash found there counts.
-				state := commitState(worklog.RepoRoot(c.Evidence.Cwd), f.Ref, f.Value)
+				state := commitState(commitRoot(c.Evidence, cwd), f.Ref, f.Value)
 				if strings.HasPrefix(state, "확인 불가") && f.Ref != "" {
 					if found := commitState(worklog.RepoRoot(cwd), f.Ref, f.Value); strings.HasPrefix(found, "커밋 ") {
 						state = found
@@ -179,11 +235,15 @@ func sessionCheck(session, cwd string, files []string, ended, now time.Time) str
 				}
 				// The state names a commit git has; any other is named by its hash or subject.
 				if !strings.HasPrefix(state, "커밋 ") {
-					name := f.Ref
+					name := f.Ref[:min(8, len(f.Ref))]
 					if name == "" {
 						name = cut(f.Value, 20)
 					}
 					state = name + " → " + state
+				}
+				// Another repository's commit says which one.
+				if repo := parts[1]; len(parts) > 2 && repo != RepoName(cwd) {
+					state = repo + " 레포 " + state
 				}
 				notes = append(notes, state)
 				commits++
@@ -262,6 +322,12 @@ func factKind(slot string) string {
 		if len(parts) == 3 {
 			return "PR " + parts[1] + "#" + parts[2]
 		}
+	case "push":
+		repo, ref, _ := strings.Cut(rest, "/")
+		return "push " + repo + " " + ref
+	case "relation":
+		from, to, _ := strings.Cut(rest, "/")
+		return "레포 관계 " + from + " → " + to
 	case "choice":
 		return "선택"
 	case "rule":

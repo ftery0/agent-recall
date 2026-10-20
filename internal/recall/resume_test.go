@@ -227,7 +227,7 @@ func TestResumeKeepsSameFolderTasksAmbiguousUntilRequestNamesOne(t *testing.T) {
 	resumeFixture(t, cwd, "22222222-0000-0000-0000-000000000000", "ready", summary{Title: "원본 저장 개선", Todo: []string{"중단 복구 시험"}})
 	current := resumeTranscript(t, cwd, resumeHuman("yes", "응"))
 	card, err := ResumeText(cwd, current)
-	if err != nil || !strings.Contains(card, "작업 후보 2개") || !strings.Contains(card, "언어 설정 개선") || !strings.Contains(card, "원본 저장 개선") || strings.Contains(card, "사용자 요청의 제목과 일치") {
+	if err != nil || !strings.Contains(card, "이 레포 대화 2개") || !strings.Contains(card, "언어 설정 개선") || !strings.Contains(card, "원본 저장 개선") || strings.Contains(card, "사용자 요청의 제목과 일치") {
 		t.Fatalf("recency or confirmation incorrectly selected a task: card=%s error=%v", card, err)
 	}
 	current = resumeTranscript(t, cwd, resumeHuman("specific", "원본 저장 작업 이어가자"))
@@ -372,7 +372,7 @@ func TestResumeDoesNotSelectTaskFromOneGenericTitleWord(t *testing.T) {
 	resumeFixture(t, cwd, "aaaaaaaa-0000-0000-0000-000000000000", "ready", summary{Title: "언어 설정 개선", Todo: []string{"시험"}})
 	resumeFixture(t, cwd, "bbbbbbbb-0000-0000-0000-000000000000", "ready", summary{Title: "원본 저장 개선", Todo: []string{"시험"}})
 	card, err := ResumeText(cwd, resumeTranscript(t, cwd, resumeHuman("new", "설정을 이어가줘")))
-	if err != nil || !strings.Contains(card, "작업 후보 2개") || strings.Contains(card, "사용자 요청의 제목과 일치") {
+	if err != nil || !strings.Contains(card, "이 레포 대화 2개") || strings.Contains(card, "사용자 요청의 제목과 일치") {
 		t.Fatalf("one generic word selected a task: card=%s error=%v", card, err)
 	}
 }

@@ -20,23 +20,64 @@ func TestCommitsMadeReadsGitAndRtkOutput(t *testing.T) {
 	if bare := commitsMade(`git commit -m "fix: c"`, "ok 3 files changed"); len(bare) != 1 || bare[0] != (madeCommit{"", "fix: c"}) {
 		t.Fatal("해시 없는 rtk 출력에서 제목을 잃음", bare)
 	}
+	if quiet := commitsMade(`git commit -qam "fix: e" && git log --oneline -1`, "ok\n30732e9 fix: e"); len(quiet) != 1 || quiet[0] != (madeCommit{"30732e9", "fix: e"}) {
+		t.Fatal("rtk 가 ok 만 찍은 커밋의 로그 줄을 못 읽음", quiet)
+	}
 	if none := commitsMade(`git commit -m "fix: d"`, "nothing to commit, working tree clean"); len(none) != 0 {
 		t.Fatal("커밋 안 된 명령을 커밋으로 읽음", none)
 	}
 }
 
-func TestCommandDirFollowsCdAndGitC(t *testing.T) {
+func TestShellStepsFollowFoldersAndVariables(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	for shell, want := range map[string]string{
-		`git commit -m x`:                        "/work/repo",
-		`cd web && git add . && git commit -m x`: "/work/repo/web",
-		`cd "/a b" && cd c; git commit -m x`:     "/a b/c",
-		`git -C ~/other commit -m x`:             filepath.Join(home, "other"),
-		`git commit -m x && cd later`:            "/work/repo",
+		`git commit -m x`:                                                "/work/repo",
+		`cd web && git add . && git commit -m x`:                         "/work/repo/web",
+		`cd "/a b" && cd c; git commit -m x`:                             "/a b/c",
+		`git -C ~/other commit -m x`:                                     filepath.Join(home, "other"),
+		`git commit -m x && cd later`:                                    "/work/repo",
+		`W=/tmp/w; cd "$W" && git commit -qm x`:                          "/tmp/w",
+		`export W=/x/y; git -C $W/z commit -m x`:                         "/x/y/z",
+		`(cd sub && git status); git commit -m x`:                        "/work/repo",
+		`pushd ../b >/dev/null && git commit -m x && popd`:               "/work/b",
+		`W=$(mktemp -d); cd $W && git commit -m x`:                       "",
+		`bash -c "cd /p && git commit -m x"`:                             "/p",
+		`if git diff --cached --quiet; then :; else git commit -m x; fi`: "/work/repo",
+		`f() { git commit -m "$1"; }; f msg`:                             "/work/repo",
+		`rtk git -c user.name=t commit -m x 2>&1 | tail -1`:              "/work/repo",
+		"git add \\\n  a.go \\\n  b.go && \\\ngit commit -m x":           "/work/repo",
+		"cd \\\n  web && git commit -m x":                                "/work/repo/web",
 	} {
-		if got := commandDir("/work/repo", shell); got != want {
-			t.Errorf("%s: got %q, want %q", shell, got, want)
+		dir, found := "", false
+		for _, step := range shellSteps("/work/repo", shell) {
+			if step.kind == "commit" {
+				dir, found = step.dir, true
+			}
 		}
+		if !found || dir != want {
+			t.Errorf("%s: got %q (found %v), want %q", shell, dir, found, want)
+		}
+	}
+	for _, shell := range []string{`rg -n "git commit" .`, `echo 'git commit -m x' && git status`, "cat > a.md <<'EOF'\ngit commit -m x\nEOF"} {
+		for _, step := range shellSteps("/work/repo", shell) {
+			if step.kind == "commit" {
+				t.Errorf("%s: 따옴표나 heredoc 안의 글을 커밋으로 봄", shell)
+			}
+		}
+	}
+	// Files a command wrote, and checks told apart from a search for the word.
+	var wrote []string
+	checks := 0
+	for _, step := range shellSteps("/work/repo", "cat > a.md <<'EOF'\nbody > b.md\nEOF\nsed -i '' 's/a/b/' c.go && go test ./... 2>&1 | tee -a /tmp/log; rg test d.go >/dev/null; pnpm --filter web typecheck; pnpm add eslint") {
+		switch step.kind {
+		case "write":
+			wrote = append(wrote, step.to)
+		case "check":
+			checks++
+		}
+	}
+	if strings.Join(wrote, " ") != "/work/repo/a.md /work/repo/c.go /tmp/log /dev/null" || checks != 2 {
+		t.Fatal("쓴 파일이나 검사를 잘못 읽음", wrote, checks)
 	}
 }
 
@@ -142,14 +183,19 @@ func TestBuildRecordsCommitsPullRequestsAndConfirmedRules(t *testing.T) {
 	}
 	var rule factState
 	kinds := map[string]bool{}
+	commits := map[string]string{}
 	for _, f := range foldFacts(lines) {
 		kinds[strings.SplitN(f.Slot, "/", 2)[0]] = true
 		if strings.HasPrefix(f.Slot, "rule/") {
 			rule = f
 		}
-		if strings.HasPrefix(f.Slot, "commit/") && (f.Ref != "9a8b7c6d" || f.Value != "fix: 헤더 정리" || f.Status != factActive) {
-			t.Fatal("커밋 사실이 틀림", f)
+		if strings.HasPrefix(f.Slot, "commit/repo/") && f.Status == factActive {
+			commits[f.Value] = f.Ref
 		}
+	}
+	// The folder is gone: the output's hash stands, and a run that succeeded whole made its subject.
+	if len(commits) != 2 || commits["fix: 헤더 정리"] != "9a8b7c6d" || commits["remove hide"] != "" {
+		t.Fatal("커밋 사실이 틀림", commits)
 	}
 	if !kinds["commit"] || !kinds["pr"] || rule.Status != factProposed {
 		t.Fatal("커밋·PR 이 없거나 교훈이 AI 후보로 오지 않음", kinds, rule)

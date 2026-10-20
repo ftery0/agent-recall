@@ -40,8 +40,10 @@ func TestReadSessionFixedFields(t *testing.T) {
 	if len(s.commands) != 2 || s.commands[0].result != "실패" || s.commands[1].result != "성공" {
 		t.Fatal(s.commands)
 	}
+	// The folder is gone, so git cannot say; a commit run that succeeded whole still made it.
+	newGitCache().readGit(&s)
 	text := render(s, summary{}, false)
-	for _, want := range []string{"## 내용", "## 자료", "## 소스", "summary: 없음", "`pnpm test` → 실패", "### 커밋\n- remove hide → 성공", "token=[가림]"} {
+	for _, want := range []string{"## 내용", "## 자료", "## 소스", "summary: 없음", "`pnpm test` → 실패", "### 커밋\n- remove hide (repo, 해시 모름) [tool:b2]", "token=[가림]"} {
 		if !strings.Contains(text, want) {
 			t.Fatal("missing", want, "\n", text)
 		}
@@ -74,13 +76,14 @@ func TestRecordKeepsAnswersEndingCompactionAndCommitSubject(t *testing.T) {
 	if !ok {
 		t.Fatal("session not read", s)
 	}
+	newGitCache().readGit(&s)
 	text := render(s, summary{}, false)
 	for _, want := range []string{
 		"title: \"헤더 숨김 빼줘\"",
 		"헤더 숨김 빼줘\n  → AI(주장): 헤더 숨김을 뺐습니다.",
 		"### 끝난 지점\n- 원인은 OAuth 만료입니다. 다시 로그인하면 됩니다. (AI 주장)",
 		"### 압축 요약 (AI 작성·주장)\n> 요약 언어: 한국어\n> ### 남은 일\n> - 로그인 다시 확인\n",
-		"### 커밋\n- fix: 헤더 숨김 제거 → 성공",
+		"### 커밋\n- fix: 헤더 숨김 제거 (repo, 해시 모름) [tool:c1]",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q\n%s", want, text)
@@ -352,6 +355,7 @@ func TestFindRanksRecordAndEvalCounts(t *testing.T) {
 func TestFormatRebuildKeepsModelSummary(t *testing.T) {
 	_, _, path := recordFixture(t)
 	s, _ := readSession("claude", path)
+	newGitCache().readGit(&s)
 	m := summary{Title: "헤더 숨김 제거", Decisions: []decision{{What: "훅 삭제", Why: "항상 보이게"}}, Todo: []string{"화면 확인"}, Lessons: []string{"주석도 같이 고친다"}}
 	old := strings.Replace(render(s, m, true), fmt.Sprintf("format: %d\n", recordFormat), "", 1)
 	dest := filepath.Join(RecordDir(), "2026-10-07", "1000-repo-abcdef12.md")
@@ -507,26 +511,14 @@ func TestALookupWrittenInsideAHeredocIsNotRun(t *testing.T) {
 	}
 }
 
-func TestOnlyACommitRunOutsideQuotesIsACommit(t *testing.T) {
-	for shell, want := range map[string]bool{
-		`git commit -m "fix: a"`:                   true,
-		`git -C ~/other commit -m x`:               true,
-		`git -c user.name=t -C "/a b" commit -m x`: true,
-		`rg -n "git commit" .`:                     false,
-		`echo 'git commit -m x' && git status`:     false,
-		`git log --grep="commit"`:                  false,
-	} {
-		if got := runsCommit(shellOnly(shell)); got != want {
-			t.Errorf("%s: got %v", shell, got)
-		}
-	}
-	if runsCommit(shellOnly("cat > a.md <<'EOF'\ngit commit -m x\nEOF")) {
-		t.Fatal("heredoc 안의 글을 커밋으로 봄")
-	}
+func TestCommitSubjectsReadQuotedAndHeredocMessages(t *testing.T) {
 	for command, want := range map[string]string{
-		`git -C "/a b" commit -m "fix: 제목"`:                             "fix: 제목",
-		`git -c user.name=t -c user.email=t@t commit -qm init && cd /x`: "init",
-		"git commit -F - -m \"$(cat <<'EOF'\nfix: 여러 줄\n\n본문\nEOF\n)\"": "fix: 여러 줄",
+		`git -C "/a b" commit -m "fix: 제목"`:                                                                        "fix: 제목",
+		`git -c user.name=t -c user.email=t@t commit -qm init && cd /x`:                                            "init",
+		"git commit -F - -m \"$(cat <<'EOF'\nfix: 여러 줄\n\n본문\nEOF\n)\"":                                            "fix: 여러 줄",
+		"git add a && git commit -q -F - <<'MSG'\nrefactor: 입력으로 준 제목\n\n본문\nMSG\ngit log -1":                      "refactor: 입력으로 준 제목",
+		"cat > /tmp/msg.txt <<'EOF'\n\nfix: 파일로 준 제목\nEOF\ngit commit -qF /tmp/msg.txt":                            "fix: 파일로 준 제목",
+		"cat <<EOF > \"$T/m\"\nfix: 다른 파일\nEOF\ncat <<EOF >/tmp/msg\nfeat: 맞는 파일\nEOF\ngit commit --file=/tmp/msg": "feat: 맞는 파일",
 	} {
 		if got := commitSubjects(command); len(got) != 1 || got[0] != want {
 			t.Errorf("%s: got %q, want %q", command, got, want)
@@ -535,12 +527,12 @@ func TestOnlyACommitRunOutsideQuotesIsACommit(t *testing.T) {
 }
 
 func TestALongRunOfChecksKeepsTheCommit(t *testing.T) {
-	s := session{id: "s", cwd: "/w", commands: []command{{text: `git commit -m "fix: 먼저"`, source: "tool:c", result: "성공"}}}
+	s := session{id: "s", cwd: "/w", events: []gitEvent{{kind: "commit", repo: "w", hash: "1a2b3c4d5e", subject: "fix: 먼저", ref: "dev", source: "tool:c"}}}
 	for i := range 20 {
-		s.commands = append(s.commands, command{text: fmt.Sprintf("pnpm test %d", i), source: "tool:t", result: "성공"})
+		s.commands = append(s.commands, command{text: fmt.Sprintf("pnpm test %d", i), source: "tool:t", result: "성공", check: true})
 	}
 	text := render(s, summary{}, false)
-	if !strings.Contains(text, "### 커밋\n- fix: 먼저 → 성공 [tool:c]") || strings.Contains(text, "pnpm test 4`") || !strings.Contains(text, "pnpm test 19`") {
+	if !strings.Contains(text, "### 커밋\n- 1a2b3c4d fix: 먼저 (w dev) [tool:c]") || strings.Contains(text, "pnpm test 4`") || !strings.Contains(text, "pnpm test 19`") {
 		t.Fatal("검사가 많으면 앞선 커밋이 기록에서 밀려남", text)
 	}
 }

@@ -19,7 +19,11 @@ var (
 	hintTicket   = regexp.MustCompile(`(?i)\bTSK-\d+\b`)
 	hintPR       = regexp.MustCompile(`(?i)\bPR\s*#?\s*(\d{2,5})\b`) // "PR 2개" is a count, not a number
 	hintLeftOff  = regexp.MustCompile(`저번|지난\s?번|전에 하던|하던\s?거|하다가?\s?말`)
-	hintPasted   = regexp.MustCompile(`(?s)<pasted_content[^>]*>.*?(</pasted_content[^>]*>|$)`)
+	// The person saying the agent forgot: what it should have known is the topic's past, or this repository's.
+	hintForgot = regexp.MustCompile(`기억\s?(안\s?나|못|안\s?해|해\s?봐|나\?|나니)|(했|말했|얘기했|애기했|시켰)잖아|다른\s?(세션|대화|창)|까먹|잊어|잊었`)
+	// A date followed by a time is a log line's, not a day asked about.
+	hintClock  = regexp.MustCompile(`^\s*\d{1,2}:\d\d`)
+	hintPasted = regexp.MustCompile(`(?s)<pasted_content[^>]*>.*?(</pasted_content[^>]*>|$)`)
 	// Agent reports, task notices and reminders reach the prompt hook too; they are not the person's.
 	hintMachine = regexp.MustCompile(`(?s)<(agent-message|task-notification|system-reminder)\b[^>]*>.*?(</(agent-message|task-notification|system-reminder)>|$)`)
 	hintLogTime = regexp.MustCompile(`^[ T]\d\d:\d\d`)
@@ -32,7 +36,10 @@ var (
 		"보고": true, "정리": true, "확인": true, "하자": true, "해보자": true, "진행": true, "얘기": true, "애기": true, "무슨": true,
 		"어떻게": true, "됐어": true, "됐지": true, "했어": true, "할일": true, "해야": true, "해야되는거": true, "부분": true, "내용": true,
 		"뭐하다": true, "하다": true, "말았니": true, "말았지": true, "기억": true, "안나": true, "지금": true, "한번": true, "그냥": true,
-		"일단": true, "근데": true, "그리고": true, "전부": true, "전부다": true, "이제": true, "같은데": true, "보니까": true}
+		"일단": true, "근데": true, "그리고": true, "전부": true, "전부다": true, "이제": true, "같은데": true, "보니까": true,
+		"아까": true, "마저": true, "마져": true, "했었는데": true, "제대로": true, "했잖아": true, "말했잖아": true, "그때": true, "저번에": true,
+		"기억해": true, "기억나": true, "못해": true, "못하고": true, "안돼": true, "있잖아": true, "알아서": true, "솔직히": true, "레포": true,
+		"다른": true, "까먹었어": true, "까먹었니": true, "했던거": true, "하던것": true, "했던": true}
 	hintFillerEnd = []string{"줘", "줘봐", "봐", "봐줘", "해봐", "할까", "했지", "했나", "는지", "던데", "있니", "있냐"}
 	hintDayPart   = regexp.MustCompile(`^\d{1,2}(월|일)$`)
 )
@@ -45,10 +52,6 @@ func hintTopic(prompt string) []string {
 		if len([]rune(word)) >= 2 && contentWord(word) && !hintDayWord(word) && !slices.Contains(topic, word) {
 			topic = append(topic, word)
 		}
-	}
-	// A long sentence left after the filler is not a topic to search for.
-	if len(topic) > 4 {
-		return nil
 	}
 	return topic
 }
@@ -72,7 +75,7 @@ func hintDayWord(word string) bool {
 
 // HintText is what the harness looks up before the agent answers: the day, ticket, pull request
 // or unfinished work a request points to. A request that points nowhere in the past gets nothing.
-func HintText(prompt, cwd, session string, now time.Time) string {
+func HintText(prompt, cwd, session, transcript string, now time.Time) string {
 	// Pasted text is someone else's words, often logs full of dates and numbers.
 	prompt = hintMachine.ReplaceAllString(hintPasted.ReplaceAllString(prompt, " "), " ")
 	if strings.HasPrefix(strings.TrimSpace(prompt), "This session is being continued from a previous conversation") {
@@ -84,6 +87,23 @@ func HintText(prompt, cwd, session string, now time.Time) string {
 	if day, ok := hintDay(prompt, now); ok {
 		parts = append(parts, dayHint(day, repo, topic))
 	}
+	lines, _ := readFacts()
+	folded := foldFacts(lines)
+	for _, name := range namedRepos(prompt, folded) {
+		if len(parts) < 3 {
+			parts = append(parts, repoHint(name, cwd, folded))
+		}
+	}
+	// Work about to go out: what this conversation's repositories are, said once.
+	if actionWords.MatchString(prompt) {
+		var targets []string
+		if root := worklog.RepoRoot(cwd); root != "" {
+			targets = append(targets, root)
+		}
+		if notes := actionNotes(targets, transcript, session); len(notes) > 0 {
+			parts = append(parts, "["+strings.Join(notes, "]\n[")+"]")
+		}
+	}
 	var tickets []string
 	for _, ticket := range hintTicket.FindAllString(prompt, -1) {
 		if ticket = strings.ToUpper(ticket); len(tickets) < 2 && !slices.Contains(tickets, ticket) {
@@ -91,19 +111,27 @@ func HintText(prompt, cwd, session string, now time.Time) string {
 			parts = append(parts, findHint(ticket, ticket, 3))
 		}
 	}
-	for _, m := range hintPR.FindAllStringSubmatchIndex(prompt, 2) {
+	var numbers []string
+	for _, m := range hintPR.FindAllStringSubmatchIndex(prompt, -1) {
 		n := prompt[m[2]:m[3]]
+		if slices.Contains(numbers, n) || len(numbers) == 2 {
+			continue
+		}
+		numbers = append(numbers, n)
 		if worklog.ForeignPR(prompt[:m[0]], worklog.RepoRoot(cwd)) {
 			parts = append(parts, foreignPRHint(cwd, n, worklog.PRWord(prompt[:m[0]])))
 		} else {
 			parts = append(parts, prHint(cwd, n))
 		}
 	}
-	// "저번 주" is a week, not the work left off.
-	if len(parts) == 0 && hintLeftOff.MatchString(strings.NewReplacer("저번주", "", "저번 주", "").Replace(prompt)) {
+	// "저번 주" is a week, not the work left off. Told it forgot, the agent gets both the topic's past
+	// and this repository's latest conversations.
+	forgot := hintForgot.MatchString(prompt)
+	if len(parts) == 0 && (forgot || hintLeftOff.MatchString(strings.NewReplacer("저번주", "", "저번 주", "").Replace(prompt))) {
 		if hint := topicHint(topic, session); hint != "" {
 			parts = append(parts, hint)
-		} else {
+		}
+		if len(parts) == 0 || forgot {
 			parts = append(parts, leftOffHint(repo, session))
 		}
 	}
@@ -133,9 +161,12 @@ func hintDay(prompt string, now time.Time) (time.Time, bool) {
 		day, err := parseDay(prompt[m[0]:m[1]], now)
 		return day, err == nil
 	}
-	if m := hintMonthDay.FindStringSubmatch(prompt); m != nil {
-		month, _ := strconv.Atoi(m[1])
-		date, _ := strconv.Atoi(m[2])
+	for _, m := range hintMonthDay.FindAllStringSubmatchIndex(prompt, -1) {
+		if hintClock.MatchString(prompt[m[1]:]) {
+			continue
+		}
+		month, _ := strconv.Atoi(prompt[m[2]:m[3]])
+		date, _ := strconv.Atoi(prompt[m[4]:m[5]])
 		day, err := parseDay(fmt.Sprintf("%02d-%02d", month, date), now)
 		return day, err == nil
 	}
@@ -167,9 +198,14 @@ func topicHint(topic []string, session string) string {
 	if len(topic) == 0 {
 		return ""
 	}
+	// A long request names its topic best by the words fewest conversations hold.
+	ix := newIndex(documents())
+	if topic = ix.rarest(topic, 4); len(topic) == 0 {
+		return ""
+	}
 	query := strings.Join(topic, " ")
 	var lines []string
-	for _, h := range Find(query, 6) {
+	for _, h := range ix.search(query, 6, time.Now(), nil) {
 		id := header([]byte(h.text), "session")
 		if id == session && id != "" || len(lines) == 3 {
 			continue

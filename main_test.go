@@ -368,3 +368,32 @@ func TestPromptHookAddsThePastARequestPointsToInJSONBothClientsRead(t *testing.T
 		t.Fatal("주간 확인을 남기지 않음", err)
 	}
 }
+
+func TestActionHookSpeaksBeforeAPushFromARepositoryWithNoRemote(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("HARNESS_HOME", filepath.Join(root, "data"))
+	t.Setenv("HARNESS_VAULT_DIR", filepath.Join(root, "vault"))
+	t.Setenv("HARNESS_RECALL", "")
+	repo := filepath.Join(root, "local")
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatal(err, string(out))
+	}
+	said := func(out any) string {
+		object, _ := out.(memory.Object)
+		specific, _ := object["hookSpecificOutput"].(memory.Object)
+		return memory.Text(specific["additionalContext"])
+	}
+	payload := memory.Object{"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": map[string]any{"command": "git push"}, "cwd": repo, "session_id": "s1"}
+	if text := said(runWithInput(t, payload, "worklog", "claude", "action")); !strings.Contains(text, "원격 없음") {
+		t.Fatal("원격 없는 레포의 push 앞에 말하지 않음", text)
+	}
+	payload["session_id"], payload["hook_event_name"] = "s2", "PostToolUse"
+	if text := said(runWithInput(t, payload, "edit-scope", "codex")); text != "" {
+		t.Fatal("Codex 도구 실행 뒤에도 행동 기억을 붙임", text)
+	}
+	payload["hook_event_name"] = "PreToolUse"
+	if text := said(runWithInput(t, payload, "edit-scope", "codex")); !strings.Contains(text, "원격 없음") {
+		t.Fatal("Codex 명령 앞에 행동 기억을 붙이지 않음", text)
+	}
+}
