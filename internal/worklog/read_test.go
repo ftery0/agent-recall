@@ -193,6 +193,55 @@ func TestMetaNoticeClearsAgentContextWithoutBecomingUserRequest(t *testing.T) {
 	}
 }
 
+func vscodeRow(id, origin string, content any) map[string]any {
+	return map[string]any{"type": "user", "uuid": id, "promptSource": "sdk", "entrypoint": "claude-vscode", "version": "2.1.233", "origin": map[string]any{"kind": origin}, "message": map[string]any{"content": content}}
+}
+
+func TestConversationReadsVSCodePromptsAndSkipsItsNotices(t *testing.T) {
+	prompt := vscodeRow("prompt", "human", []any{
+		map[string]any{"type": "text", "text": "<ide_opened_file>The user opened the file /repo/src/app.ts in the IDE.</ide_opened_file>"},
+		map[string]any{"type": "text", "text": "버튼 색을 바꿔줘"},
+	})
+	notice := vscodeRow("notice", "task-notification", "작업이 끝났습니다")
+	tagged := vscodeRow("tagged", "", "<task-notification>\n<task-id>t1</task-id>\n</task-notification>")
+	delete(tagged, "origin")
+	answer := choiceRow("answer", "ask", "어떤 색으로 할까요?", "파랑")
+	answer["entrypoint"] = "claude-vscode"
+	script := typedRow("script", "자동 시험 요청")
+	script["promptSource"], script["entrypoint"] = "sdk", "sdk-cli"
+	requests, _, err := ReadConversation(transcriptRows(t, prompt, questionRow("question", "ask", "어떤 색으로 할까요?"), notice, tagged, answer, script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 || requests[0].Text != "버튼 색을 바꿔줘" || requests[0].Source != "claude:vscode" || requests[1].Text != "질문: 어떤 색으로 할까요?\n선택: 파랑" {
+		t.Fatalf("VS Code prompt or its UI answer lost, or a notice became a request: %+v", requests)
+	}
+}
+
+func TestConversationKeepsSkillCallsAndSkipsCommandRecords(t *testing.T) {
+	row := func(id, version, entrypoint, text string) map[string]any {
+		return map[string]any{"type": "user", "uuid": id, "version": version, "entrypoint": entrypoint, "message": map[string]any{"content": text}}
+	}
+	caveat := row("caveat", "2.1.233", "claude-vscode", "<local-command-caveat>Caveat: run directly</local-command-caveat>")
+	caveat["isMeta"] = true
+	builtin := row("builtin", "2.1.233", "claude-vscode", "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>sonnet</command-args>")
+	builtin["parentUuid"] = "caveat"
+	requests, _, err := ReadConversation(transcriptRows(t,
+		row("bare", "2.1.109", "cli", "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"),
+		row("stdout", "2.1.109", "cli", "<local-command-stdout>Set model</local-command-stdout>"),
+		row("stderr", "2.1.109", "cli", "<local-command-stderr>failed</local-command-stderr>"),
+		row("skill", "2.1.109", "cli", "<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>변경을 다시 확인해</command-args>"),
+		row("plan", "2.1.270", "cli", "<command-name>/plan</command-name>\n<command-message>plan</command-message>\n<command-args>계획을 세워</command-args>"),
+		row("scripted", "2.1.270", "sdk-cli", "<command-name>/review</command-name>\n<command-args>자동 검사</command-args>"),
+		caveat, builtin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 || requests[0].Text != "/review 변경을 다시 확인해" || requests[1].Text != "/plan 계획을 세워" || requests[0].Source != "claude:command" || requests[1].Source != "claude:command" {
+		t.Fatalf("skill call lost or a command record became a request: %+v", requests)
+	}
+}
+
 func codexUser(id, text string) map[string]any {
 	return map[string]any{"type": "response_item", "payload": map[string]any{"type": "message", "role": "user", "id": id, "content": []any{map[string]any{"type": "input_text", "text": text}}}}
 }
@@ -205,6 +254,90 @@ func TestCodexConversationPreservesHumanEventsAndExcludesInjectedContext(t *test
 	}
 	if len(requests) != 3 || requests[0].ID == requests[1].ID || requests[2].Source != "codex:user" {
 		t.Fatalf("repetition lost or injected context promoted: %+v", requests)
+	}
+}
+
+func TestCodexConversationKeepsTheRequestUnderAppContext(t *testing.T) {
+	attachedOnly := "# Files mentioned by the user:\n\n## notes.txt: /tmp/notes.txt\n\nThe attached pasted text file(s) contain the user's request.\n\n## My request for Codex:"
+	requests, _, err := ReadConversation(transcriptRows(t,
+		codexUser("files", "# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\n\n## My request for Codex:\n아이콘 색을 고쳐줘\n"),
+		codexUser("browser", "<in-app-browser-context source=\"ambient-ui-state\">\nThis block is automatically supplied ambient UI state.\n# In app browser:\n- Current URL: http://localhost:3000/\n</in-app-browser-context>\n## My request:\n로그인 했어"),
+		codexUser("ide", "# Context from my IDE setup:\n\n## Open tabs:\n- app.ts: src/app.ts\n\n## My request:\n이 파일을 정리해줘"),
+		codexUser("attached", attachedOnly),
+		codexUser("ambient", "<in-app-browser-context source=\"ambient-ui-state\">\n# In app browser:\n- Current URL: http://localhost:3000/\n</in-app-browser-context>"),
+		codexUser("heartbeat", "<heartbeat>\n  <instructions>남은 작업을 이어간다</instructions>\n</heartbeat>"),
+		codexUser("delegation", "<codex_delegation>\n  <input>이 작업을 이어가세요</input>\n</codex_delegation>"),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range requests {
+		got = append(got, r.Text)
+	}
+	if strings.Join(got, "|") != strings.Join([]string{"아이콘 색을 고쳐줘", "로그인 했어", "이 파일을 정리해줘", attachedOnly}, "|") {
+		t.Fatalf("app context hid the request or became one: %q", got)
+	}
+}
+
+func replyItem(call string, index int, question, answer string) map[string]any {
+	ref, _ := json.Marshal([]any{"request_user_input_async", call, index})
+	return map[string]any{"questionItemId": string(ref), "question": question, "answer": answer}
+}
+
+func questionReply(t *testing.T, id string, items ...map[string]any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return codexUser(id, "<send_user_message_question_reply>\n"+string(raw)+"\n</send_user_message_question_reply>")
+}
+
+func TestCodexQuestionReplyBecomesChoices(t *testing.T) {
+	call := map[string]any{"type": "response_item", "payload": map[string]any{"type": "function_call", "name": "request_user_input_async", "call_id": "call-1",
+		"arguments": `{"questions":[{"title":"어느 쪽으로 할까요?","options":["왼쪽","오른쪽"]},{"title":"언제 할까요?"}]}`}}
+	broken := "<send_user_message_question_reply>\n선택을 읽을 수 없음\n</send_user_message_question_reply>"
+	requests, _, err := ReadConversation(transcriptRows(t,
+		codexUser("ask", "정할 것을 물어봐"), call,
+		questionReply(t, "reply", replyItem("call-1", 0, "어느 쪽?", "왼쪽"), replyItem("call-1", 1, "언제?", "오늘")),
+		questionReply(t, "unpaired", replyItem("call-2", 0, "범위를 넓힐까요?", "아니요")),
+		codexUser("broken", broken),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Request{
+		{Text: "정할 것을 물어봐", Source: "codex:user"},
+		{Text: "질문: 어느 쪽으로 할까요?\n선택: 왼쪽", Source: "codex:choice", QuestionID: "call-1"},
+		{Text: "질문: 언제 할까요?\n선택: 오늘", Source: "codex:choice", QuestionID: "call-1"},
+		{Text: "질문: 범위를 넓힐까요?\n선택: 아니요", Source: "codex:choice", QuestionID: "call-2"},
+		{Text: broken, Source: "codex:user"},
+	}
+	if len(requests) != len(want) || requests[1].ID == requests[2].ID {
+		t.Fatalf("question reply not split into choices: %+v", requests)
+	}
+	for i, w := range want {
+		if r := requests[i]; r.Text != w.Text || r.Source != w.Source || r.QuestionID != w.QuestionID {
+			t.Fatalf("request %d: got %+v, want %+v", i, r, w)
+		}
+	}
+}
+
+func TestCodexBlockingQuestionAnswersBecomeChoices(t *testing.T) {
+	call := map[string]any{"type": "response_item", "payload": map[string]any{"type": "function_call", "name": "request_user_input", "call_id": "call-9",
+		"arguments": `{"questions":[{"header":"소스","id":"design_source","question":"어떤 디자인 소스를 기준으로 할까요?"},{"id":"scope","question":"범위는?"},{"id":"skipped","question":"건너뛴 질문"}]}`}}
+	output := map[string]any{"type": "response_item", "payload": map[string]any{"type": "function_call_output", "call_id": "call-9",
+		"output": `{"answers":{"scope":{"answers":["home","shared"]},"design_source":{"answers":["피그마 원본"]}}}`}}
+	other := map[string]any{"type": "response_item", "payload": map[string]any{"type": "function_call_output", "call_id": "call-1", "output": `{"answers":{"scope":{"answers":["x"]}}}`}}
+	requests, _, err := ReadConversation(transcriptRows(t, codexUser("ask", "물어보고 정해"), call, output, other))
+	if err != nil || len(requests) != 3 {
+		t.Fatalf("blocking question answers not read: %+v %v", requests, err)
+	}
+	for i, want := range []string{"질문: 어떤 디자인 소스를 기준으로 할까요?\n선택: 피그마 원본", "질문: 범위는?\n선택: home, shared"} {
+		if r := requests[i+1]; r.Text != want || r.Source != "codex:choice" || r.QuestionID != "call-9" {
+			t.Fatalf("choice %d: got %+v", i, r)
+		}
 	}
 }
 

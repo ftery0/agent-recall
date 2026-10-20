@@ -213,7 +213,7 @@ func grounded(s session, id, evidence string) string {
 		return ""
 	}
 	for _, r := range s.requests {
-		if r.ID == id && r.Source == "claude:choice" {
+		if r.ID == id && strings.HasSuffix(r.Source, ":choice") {
 			_, answer, ok := strings.Cut(r.Text, "\n선택: ")
 			if !ok || !strings.Contains(evidence, answer) {
 				return ""
@@ -252,7 +252,7 @@ func mergeSummary(s session, old, fresh summary) summary {
 		}
 		// A UI answer is already explicit: store it verbatim instead of a model paraphrase.
 		for _, r := range s.requests {
-			if d.Status == "사용자" && r.ID == d.Source && r.Source == "claude:choice" {
+			if d.Status == "사용자" && r.ID == d.Source && strings.HasSuffix(r.Source, ":choice") {
 				d.What = mask(r.Text)
 			}
 		}
