@@ -12,6 +12,8 @@ Session memory for AI coding agents. It keeps your Claude Code and Codex convers
 - **Dated records** — writes one Markdown record per conversation: requests with their time, the agent's answers (marked as claims), the last stopping point, changed files, checks, commits, and the memory lookups the agent ran.
 - **Start card** — when a conversation starts, shows the latest requests, related records, recent work notes and git state (within 3,000 characters). It warns when a note's pull request was merged after the note was saved, or when files named in a project memory were committed after it.
 - **Prompt hint** — when a request points to the past ("yesterday", a date, "where we left off", `TSK-123`, `PR #12`), it adds the matching records (within 1,200 characters). When the request also names a topic ("where did we leave the image modal"), it searches with those words first and falls back to the latest conversations. Other requests get nothing.
+- **Fact ledger** — keeps what tools showed (commits, pushes, pull requests, copies between repositories, answers to question prompts) in an append-only `recall/facts.jsonl`. Commits are confirmed from git's own history, so quiet ones (`-q`, `-F`, scripts) are kept. When a fact comes back, git is asked again whether it still holds.
+- **Action note** — right before a shell command commits, pushes, merges, copies between repositories or changes GitHub, and when a request asks for that ("push it") or names a repository, it adds what memory holds about the repositories involved: whether one has a remote, where its work was copied, and the last push with the request that preceded it. Ordinary repositories and unrelated commands get nothing.
 - **Misses** — counts memory lookups that came back empty or failed, and tells you once a week.
 
 Messages and keyword matching are currently in Korean.
@@ -35,13 +37,14 @@ Claude Code (`~/.claude/settings.json`):
   "hooks": {
     "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "harness worklog claude start", "timeout": 10 }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "harness worklog claude prompt", "timeout": 10 }] }],
+    "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "harness worklog claude action", "timeout": 10 }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "harness worklog claude stop", "timeout": 10 }] }],
     "PreCompact": [{ "hooks": [{ "type": "command", "command": "harness worklog claude precompact", "timeout": 10 }] }]
   }
 }
 ```
 
-Codex (`~/.codex/hooks.json`): the same events with `harness worklog codex start|prompt|stop`. Codex asks you to trust new hooks once.
+Codex (`~/.codex/hooks.json`): the same events with `harness worklog codex start|prompt|stop`, and `harness worklog codex action` on `PreToolUse` with the matcher `Bash`. Codex asks you to trust new hooks once.
 
 Use an absolute path in `command` if the hook environment does not have `~/.local/bin` on its `PATH`.
 
@@ -51,6 +54,7 @@ Use an absolute path in `command` if the hook environment does not have `~/.loca
 harness recall find 'words'                 # search records and work notes
 harness recall day 2026-10-15 'words'       # what was asked on one day (YYYY-MM-DD, MM-DD, 오늘, 어제)
 harness recall source <session-id> 'words'  # read the original transcript around the words
+harness recall facts 'words'                # facts from the ledger, checked against git now
 harness recall misses --days 7              # memory lookups that came back empty or failed
 harness recall build --since 2026-10-01     # rebuild records from the archive
 harness recall verify                       # check the archive against the client transcripts
